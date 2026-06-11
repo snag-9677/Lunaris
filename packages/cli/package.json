@@ -5,7 +5,7 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "lun": "./dist/main.js"
+    "lunaris": "./dist/main.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

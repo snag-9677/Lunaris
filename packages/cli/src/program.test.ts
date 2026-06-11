@@ -2,9 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildProgram } from './program.js';
 
-test('lun program wires all Phase 1 subcommands', () => {
+test('lunaris program wires all Phase 1 subcommands', () => {
   const program = buildProgram();
-  assert.equal(program.name(), 'lun');
+  assert.equal(program.name(), 'lunaris');
   const names = program.commands.map((c) => c.name());
   for (const expected of ['init', 'chat', 'status', 'events', 'daemon']) {
     assert.ok(names.includes(expected), `missing subcommand: ${expected}`);

@@ -1,5 +1,5 @@
 /**
- * Pure, dependency-free helpers for the `lun` CLI.
+ * Pure, dependency-free helpers for the `lunaris` CLI.
  * Kept side-effect free so they are cheap to unit test; only type-level
  * imports from @lunaris/core (erased at runtime).
  */
@@ -90,7 +90,7 @@ export function resolveModel(
   return manifest.models.roles?.[role] ?? manifest.models.default;
 }
 
-/** Exit code mapping for `lun chat`: success → 0, anything else → 1. */
+/** Exit code mapping for `lunaris chat`: success → 0, anything else → 1. */
 export function exitCodeForStatus(status: string | undefined): 0 | 1 {
   return status === 'success' ? 0 : 1;
 }
@@ -338,7 +338,7 @@ export interface PrincipalLike {
   status?: string;
 }
 
-/** Render `lun whoami` output lines. */
+/** Render `lunaris whoami` output lines. */
 export function formatWhoami(principal: PrincipalLike, role: string | null): string[] {
   return [
     `principal: ${principal.displayName} (${principal.id})`,
@@ -421,7 +421,7 @@ export interface DoctorReportLike {
   stores: StoreReportLike[];
 }
 
-/** Render `lun version`: harness version + a per-store schema doctor table. */
+/** Render `lunaris version`: harness version + a per-store schema doctor table. */
 export function formatDoctorReport(version: VersionInfoLike, report: DoctorReportLike): string[] {
   const lines: string[] = [];
   lines.push(`lunaris harness ${version.harness}`);

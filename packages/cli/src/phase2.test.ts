@@ -13,7 +13,7 @@ import { buildProgram } from './program.js';
 import { formatAnalytics, formatApprovalLine, formatMemoryLine } from './format.js';
 import { runApprovals, runAnalytics, runMemory, approvalsDbPath } from './commands.js';
 
-test('lun program wires the Phase 2 subcommands', () => {
+test('lunaris program wires the Phase 2 subcommands', () => {
   const program = buildProgram();
   const names = program.commands.map((c) => c.name());
   for (const expected of ['analytics', 'memory', 'approvals']) {

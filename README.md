@@ -2,7 +2,7 @@
 
 Local-first, autonomous, multi-project AI development harness. Full design: [LUNARIS_SPEC.md](LUNARIS_SPEC.md).
 
-**Status: Phase 4 — feature-complete vs the spec.** Phase 1 (per-project manifest, multi-provider gateway + transactional budget ledger, orchestrator agent loop, SQLite event spine, `lunarisd` daemon 127.0.0.1-only + WS, Mission Control UI, `lun` CLI) + Phase 2 (graphified memory, autonomy policy + taint + approvals, analytics) + Phase 3 (recursive self-optimizer, plugin host, scheduler/triggers) + Phase 4: identity/auth/RBAC (scrypt passwords, hashed bearer tokens, role→capability matrix; auth off by default for loopback), attenuable Ed25519 agent capability tokens (subagents can only shrink caps), distributed one-orchestrator-per-repo lease with epoch fencing, lifecycle (snapshot/restore + export/import bundle + two-level project identity + `lun adopt`), and a schema-migration/version/doctor framework. All crypto via node:crypto (no native deps). 314 tests.
+**Status: Phase 4 — feature-complete vs the spec.** Phase 1 (per-project manifest, multi-provider gateway + transactional budget ledger, orchestrator agent loop, SQLite event spine, `lunarisd` daemon 127.0.0.1-only + WS, Mission Control UI, `lunaris` CLI) + Phase 2 (graphified memory, autonomy policy + taint + approvals, analytics) + Phase 3 (recursive self-optimizer, plugin host, scheduler/triggers) + Phase 4: identity/auth/RBAC (scrypt passwords, hashed bearer tokens, role→capability matrix; auth off by default for loopback), attenuable Ed25519 agent capability tokens (subagents can only shrink caps), distributed one-orchestrator-per-repo lease with epoch fencing, lifecycle (snapshot/restore + export/import bundle + two-level project identity + `lunaris adopt`), and a schema-migration/version/doctor framework. All crypto via node:crypto (no native deps). 314 tests.
 
 ## Quickstart
 
@@ -44,7 +44,7 @@ node packages/daemon/dist/main.js   # http://127.0.0.1:7340 (serves packages/ui/
 | `@lunaris/scheduler` | Goal queue, cron parser, schedules, trigger rules, HMAC webhook routing, dispatcher |
 | `@lunaris/identity` | Control plane: principals, scrypt auth + sessions, RBAC role→capability matrix, Ed25519 attenuable capability tokens, lease store with epoch fencing |
 | `@lunaris/lifecycle` | Snapshot/restore, export/import bundle, two-level project identity (committed lineage + machine-local instance), `adopt` |
-| `@lunaris/cli` | `lun`: init, chat, status, events, memory, analytics, approvals, optimize, proposals, plugins, schedule, queue, login, whoami, snapshot, restore, export, adopt, lease, version, daemon |
+| `@lunaris/cli` | `lunaris`: init, chat, status, events, memory, analytics, approvals, optimize, proposals, plugins, schedule, queue, login, whoami, snapshot, restore, export, adopt, lease, version, daemon |
 | `@lunaris/ui` | Mission Control: chat + live feed + analytics / memory-graph / approvals / optimize / plugins / automation / system panels, optional login (Vite + React) |
 
 core also carries: analytics rollups, schema migration + version + doctor.

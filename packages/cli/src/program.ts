@@ -1,5 +1,5 @@
 /**
- * Commander wiring for the `lun` CLI, separated from main.ts so the
+ * Commander wiring for the `lunaris` CLI, separated from main.ts so the
  * program shape can be unit tested without executing it.
  */
 import { Command } from 'commander';
@@ -35,7 +35,7 @@ import { parseTail } from './format.js';
 export function buildProgram(): Command {
   const program = new Command();
   program
-    .name('lun')
+    .name('lunaris')
     .description('Lunaris — multi-project autonomous AI dev harness')
     .version('0.1.0')
     .showHelpAfterError();

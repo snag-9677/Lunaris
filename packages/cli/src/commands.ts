@@ -1,5 +1,5 @@
 /**
- * Command implementations for the `lun` CLI.
+ * Command implementations for the `lunaris` CLI.
  *
  * Cross-package wiring policy: sibling packages (@lunaris/core, gateway,
  * orchestrator, daemon) are authored concurrently, so all value-level access
@@ -45,7 +45,7 @@ import {
   toolLineFor,
 } from './format.js';
 
-const MANIFEST_HINT = 'No lunaris.toml found here — run `lun init` first.';
+const MANIFEST_HINT = 'No lunaris.toml found here — run `lunaris init` first.';
 /** Effectively "no limit" for EventStore.query. */
 const MAX_QUERY = 1_000_000;
 
@@ -136,7 +136,7 @@ async function openEventStore(cwd: string): Promise<EventStore> {
   return new StoreCtor(eventsDbPath(cwd));
 }
 
-// ---------- lun init ----------
+// ---------- lunaris init ----------
 
 export async function runInit(cwd: string, name?: string): Promise<number> {
   try {
@@ -157,10 +157,10 @@ export async function runInit(cwd: string, name?: string): Promise<number> {
   }
 }
 
-// ---------- lun chat ----------
+// ---------- lunaris chat ----------
 
 /**
- * Builds the Goal envelope for `lun chat`: a fresh time-ordered id, the
+ * Builds the Goal envelope for `lunaris chat`: a fresh time-ordered id, the
  * manifest's project id, the user prompt, an ISO timestamp, status 'running'.
  */
 export function buildChatGoal(goalId: string, projectId: string, prompt: string): Goal {
@@ -238,7 +238,7 @@ export async function runChat(cwd: string, prompt: string, modelOverride?: strin
   }
 }
 
-// ---------- lun status ----------
+// ---------- lunaris status ----------
 
 export async function runStatus(cwd: string): Promise<number> {
   try {
@@ -257,7 +257,7 @@ export async function runStatus(cwd: string): Promise<number> {
   }
 }
 
-// ---------- lun events ----------
+// ---------- lunaris events ----------
 
 export async function runEvents(cwd: string, tail: number): Promise<number> {
   try {
@@ -274,7 +274,7 @@ export async function runEvents(cwd: string, tail: number): Promise<number> {
   }
 }
 
-// ---------- lun daemon ----------
+// ---------- lunaris daemon ----------
 
 export async function runDaemon(port = 7340): Promise<number> {
   try {
@@ -300,7 +300,7 @@ export async function runDaemon(port = 7340): Promise<number> {
   }
 }
 
-// ---------- lun analytics ----------
+// ---------- lunaris analytics ----------
 
 export async function runAnalytics(cwd: string, since?: string): Promise<number> {
   try {
@@ -320,7 +320,7 @@ export async function runAnalytics(cwd: string, since?: string): Promise<number>
   }
 }
 
-// ---------- lun memory ----------
+// ---------- lunaris memory ----------
 
 export async function runMemory(cwd: string, query?: string, limit = 50): Promise<number> {
   try {
@@ -353,7 +353,7 @@ export async function runMemory(cwd: string, query?: string, limit = 50): Promis
   }
 }
 
-// ---------- lun approvals ----------
+// ---------- lunaris approvals ----------
 
 export interface ApprovalsOptions {
   resolve?: string;
@@ -406,7 +406,7 @@ export async function runApprovals(cwd: string, opts: ApprovalsOptions = {}): Pr
   }
 }
 
-// ---------- lun optimize ----------
+// ---------- lunaris optimize ----------
 
 /** Structural view of @lunaris/optimizer's runOptimizer. */
 type RunOptimizerFn = (opts: {
@@ -443,7 +443,7 @@ export async function runOptimize(cwd: string, sinceIso?: string): Promise<numbe
   }
 }
 
-// ---------- lun proposals ----------
+// ---------- lunaris proposals ----------
 
 export interface ProposalsOptions {
   resolve?: string;
@@ -462,7 +462,7 @@ export async function runProposals(cwd: string, opts: ProposalsOptions = {}): Pr
   try {
     const manifest = await loadProjectManifest(cwd);
     if (!existsSync(proposalDbPath(cwd))) {
-      console.log('no proposals yet — run `lun optimize` first');
+      console.log('no proposals yet — run `lunaris optimize` first');
       return 0;
     }
     const optimizerMod = await loadModule('@lunaris/optimizer');
@@ -503,7 +503,7 @@ export async function runProposals(cwd: string, opts: ProposalsOptions = {}): Pr
   }
 }
 
-// ---------- lun plugins / lun plugin ... ----------
+// ---------- lunaris plugins / lunaris plugin ... ----------
 
 interface PluginHostLike {
   list(): LoadedPlugin[];
@@ -526,7 +526,7 @@ export async function runPlugins(cwd: string): Promise<number> {
   try {
     await loadProjectManifest(cwd);
     if (!existsSync(pluginsDir(cwd))) {
-      console.log('no plugins directory — add plugins under .lunaris/plugins or run `lun plugin new <dir>`');
+      console.log('no plugins directory — add plugins under .lunaris/plugins or run `lunaris plugin new <dir>`');
       return 0;
     }
     const host = await openPluginHost(cwd);
@@ -581,7 +581,7 @@ export async function runPluginToggle(cwd: string, id: string, enable: boolean):
   }
 }
 
-// ---------- lun schedule ----------
+// ---------- lunaris schedule ----------
 
 interface ScheduleStoreLike {
   create(input: { projectId: string; cron: string; prompt?: string; vars?: Record<string, string>; enabled?: boolean }): Schedule;
@@ -660,7 +660,7 @@ export async function runSchedule(cwd: string, opts: ScheduleOptions = {}): Prom
   }
 }
 
-// ---------- lun queue ----------
+// ---------- lunaris queue ----------
 
 interface GoalQueueLike {
   push(g: { projectId: string; prompt: string; source: string; priority?: number }): QueuedGoal;

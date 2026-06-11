@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/** `lun` — Lunaris CLI entrypoint. */
+/** `lunaris` — Lunaris CLI entrypoint. */
 import { buildProgram } from './program.js';
 
 try {

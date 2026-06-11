@@ -33,7 +33,7 @@ function captureLogs(): { logs: string[]; restore: () => void } {
   return { logs, restore: () => { console.log = orig; } };
 }
 
-test('lun program wires the Phase 3 subcommands', () => {
+test('lunaris program wires the Phase 3 subcommands', () => {
   const program = buildProgram();
   const names = program.commands.map((c) => c.name());
   for (const expected of ['optimize', 'proposals', 'plugins', 'plugin', 'schedule', 'queue']) {

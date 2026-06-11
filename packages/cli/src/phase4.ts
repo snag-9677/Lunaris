@@ -1,5 +1,5 @@
 /**
- * Phase 4 `lun` commands: auth (login/whoami), lifecycle (snapshot/restore/
+ * Phase 4 `lunaris` commands: auth (login/whoami), lifecycle (snapshot/restore/
  * export/adopt), lease, and version.
  *
  * Auth uses the local SqliteIdentityStore (~/.lunaris/identity.db) directly —
@@ -35,7 +35,7 @@ import {
   formatWhoami,
 } from './format.js';
 
-const MANIFEST_HINT = 'No lunaris.toml found here — run `lun init` first.';
+const MANIFEST_HINT = 'No lunaris.toml found here — run `lunaris init` first.';
 
 function fail(err: unknown): 1 {
   console.error(err instanceof Error ? err.message : String(err));
@@ -128,7 +128,7 @@ async function openIdentity(): Promise<IdentityStoreLike> {
   return new Ctor(identityDbPath());
 }
 
-/* ---------- lun login ---------- */
+/* ---------- lunaris login ---------- */
 
 export interface LoginOptions {
   user?: string;
@@ -169,7 +169,7 @@ export async function runLogin(opts: LoginOptions = {}): Promise<number> {
   }
 }
 
-/* ---------- lun whoami ---------- */
+/* ---------- lunaris whoami ---------- */
 
 export async function runWhoami(cwd: string): Promise<number> {
   try {
@@ -215,7 +215,7 @@ async function openLifecycle(): Promise<LifecyclePkgLike> {
   return (await loadModule('@lunaris/lifecycle')) as unknown as LifecyclePkgLike;
 }
 
-/* ---------- lun snapshot [list|create] ---------- */
+/* ---------- lunaris snapshot [list|create] ---------- */
 
 export interface SnapshotOptions {
   action?: 'list' | 'create';
@@ -242,7 +242,7 @@ export async function runSnapshot(cwd: string, opts: SnapshotOptions = {}): Prom
   }
 }
 
-/* ---------- lun restore <id> [--dry-run] ---------- */
+/* ---------- lunaris restore <id> [--dry-run] ---------- */
 
 export async function runRestore(cwd: string, snapshotId: string, dryRun = false): Promise<number> {
   try {
@@ -258,7 +258,7 @@ export async function runRestore(cwd: string, snapshotId: string, dryRun = false
   }
 }
 
-/* ---------- lun export [--out <path>] ---------- */
+/* ---------- lunaris export [--out <path>] ---------- */
 
 export async function runExport(cwd: string, outPath?: string): Promise<number> {
   try {
@@ -275,7 +275,7 @@ export async function runExport(cwd: string, outPath?: string): Promise<number> 
   }
 }
 
-/* ---------- lun adopt ---------- */
+/* ---------- lunaris adopt ---------- */
 
 export async function runAdopt(cwd: string): Promise<number> {
   try {
@@ -295,7 +295,7 @@ export async function runAdopt(cwd: string): Promise<number> {
   }
 }
 
-/* ---------- lun lease ---------- */
+/* ---------- lunaris lease ---------- */
 
 interface LeaseStoreLike {
   current(repoId: string, now?: Date): Lease | null;
@@ -332,7 +332,7 @@ export async function runLease(cwd: string): Promise<number> {
   }
 }
 
-/* ---------- lun version ---------- */
+/* ---------- lunaris version ---------- */
 
 interface DoctorFn {
   (dbPaths: Record<string, string>): DoctorReport;
