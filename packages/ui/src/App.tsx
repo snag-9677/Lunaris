@@ -1,4 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { AnalyticsPanel, ApprovalsPanel, MemoryPanel } from './components/panels.js';
+
+type RightTab = 'feed' | 'analytics' | 'memory' | 'approvals';
 
 /* ---------- types (mirror of @lunaris/core EventEnvelope; UI stays dep-free) ---------- */
 
@@ -203,6 +206,7 @@ export function App() {
   const [input, setInput] = useState('');
   const [wsStatus, setWsStatus] = useState<WsStatus>('connecting');
   const [error, setError] = useState<string | undefined>();
+  const [rightTab, setRightTab] = useState<RightTab>('feed');
   const transcriptRef = useRef<HTMLDivElement | null>(null);
 
   const loadProjects = useCallback(async () => {
@@ -365,13 +369,29 @@ export function App() {
         </section>
 
         <section className="right">
-          <div className="feed-head">event feed</div>
-          <div className="feed">
-            {events.length === 0 && <div className="empty">waiting for events…</div>}
-            {events.map((ev) => (
-              <FeedRow key={ev.eventId} ev={ev} />
+          <div className="tabs">
+            {(['feed', 'analytics', 'memory', 'approvals'] as RightTab[]).map((tab) => (
+              <button
+                key={tab}
+                type="button"
+                className={`tab${rightTab === tab ? ' tab-active' : ''}`}
+                onClick={() => setRightTab(tab)}
+              >
+                {tab}
+              </button>
             ))}
           </div>
+          {rightTab === 'feed' && (
+            <div className="feed">
+              {events.length === 0 && <div className="empty">waiting for events…</div>}
+              {events.map((ev) => (
+                <FeedRow key={ev.eventId} ev={ev} />
+              ))}
+            </div>
+          )}
+          {rightTab === 'analytics' && <AnalyticsPanel projectId={selectedId} />}
+          {rightTab === 'memory' && <MemoryPanel projectId={selectedId} />}
+          {rightTab === 'approvals' && <ApprovalsPanel projectId={selectedId} />}
         </section>
       </main>
     </div>

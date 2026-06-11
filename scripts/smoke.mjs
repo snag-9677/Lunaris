@@ -11,6 +11,9 @@
  *    llm.call events, and the goal's journal file exists.
  * 4. Builds the daemon server via buildServer() and asserts GET /api/status
  *    returns 200.
+ * 5. Runs the Phase 2 smoke (scripts/smoke-phase2.mjs) which exercises memory
+ *    retention + brief, the PolicyEngine at L0/L2, computeAnalytics over a real
+ *    events.db, and GET /api/projects/:id/analytics — all offline.
  *
  * Run from anywhere: node scripts/smoke.mjs — exits 0 on success.
  */
@@ -19,6 +22,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { runPhase2Smoke } from './smoke-phase2.mjs';
 
 const core = await import(new URL('../packages/core/dist/index.js', import.meta.url).href);
 const gatewayPkg = await import(new URL('../packages/gateway/dist/index.js', import.meta.url).href);
@@ -115,6 +119,9 @@ try {
   console.log(`  llm.call rows: ${llmCalls.length}`);
   console.log(`  journal:       ${journalFromArtifacts ?? journalPath}`);
   console.log('  /api/status:   200');
+
+  // ---- 5. Phase 2 substrate (memory / policy / analytics / daemon route) ----
+  await runPhase2Smoke();
 } finally {
   if (app) await app.close().catch(() => {});
   events?.close?.();

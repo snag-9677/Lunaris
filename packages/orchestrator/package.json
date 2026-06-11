@@ -14,7 +14,9 @@
   },
   "dependencies": {
     "@lunaris/core": "workspace:*",
-    "@lunaris/gateway": "workspace:*"
+    "@lunaris/gateway": "workspace:*",
+    "@lunaris/memory": "workspace:*",
+    "@lunaris/policy": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.9.0",

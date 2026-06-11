@@ -9,11 +9,23 @@
  */
 import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import type { BudgetCaps, BudgetLedger, EventStore, Goal, LunarisManifest } from '@lunaris/core';
+import type {
+  ApprovalTicket,
+  BudgetCaps,
+  BudgetLedger,
+  EventStore,
+  Goal,
+  LunarisManifest,
+  MemoryRecord,
+  ProjectAnalytics,
+} from '@lunaris/core';
 import {
   createdFilesFrom,
   exitCodeForStatus,
+  formatAnalytics,
+  formatApprovalLine,
   formatEventLine,
+  formatMemoryLine,
   normalizeResult,
   resolveModel,
   tailEvents,
@@ -65,6 +77,14 @@ function fail(err: unknown): 1 {
 
 export function eventsDbPath(cwd: string): string {
   return join(cwd, '.lunaris', 'state', 'events.db');
+}
+
+export function memoryDbPath(cwd: string): string {
+  return join(cwd, '.lunaris', 'state', 'memory.db');
+}
+
+export function approvalsDbPath(cwd: string): string {
+  return join(cwd, '.lunaris', 'state', 'approvals.db');
 }
 
 export async function loadProjectManifest(cwd: string): Promise<LunarisManifest> {
@@ -242,6 +262,112 @@ export async function runDaemon(port = 7340): Promise<number> {
     }
     // The open server handle keeps the process alive in the foreground.
     return 0;
+  } catch (err) {
+    return fail(err);
+  }
+}
+
+// ---------- lun analytics ----------
+
+export async function runAnalytics(cwd: string, since?: string): Promise<number> {
+  try {
+    const manifest = await loadProjectManifest(cwd);
+    const core = await loadModule('@lunaris/core');
+    const compute = pick<AnyFn>(core, ['computeAnalytics'], '@lunaris/core computeAnalytics');
+    // Pass the db path string (computeAnalytics opens it read-only); empty when absent.
+    if (!existsSync(eventsDbPath(cwd))) {
+      console.log('no events recorded yet');
+      return 0;
+    }
+    const analytics = compute(eventsDbPath(cwd), manifest.project.id, since) as ProjectAnalytics;
+    for (const line of formatAnalytics(analytics)) console.log(line);
+    return 0;
+  } catch (err) {
+    return fail(err);
+  }
+}
+
+// ---------- lun memory ----------
+
+export async function runMemory(cwd: string, query?: string, limit = 50): Promise<number> {
+  try {
+    const manifest = await loadProjectManifest(cwd);
+    if (!existsSync(memoryDbPath(cwd))) {
+      console.log('no memory recorded yet');
+      return 0;
+    }
+    const memoryMod = await loadModule('@lunaris/memory');
+    const StoreCtor = pick<AnyCtor>(memoryMod, ['SqliteMemoryStore'], '@lunaris/memory SqliteMemoryStore');
+    const store = new StoreCtor({ dbPath: memoryDbPath(cwd), projectId: manifest.project.id }) as {
+      search(query: string, limit?: number): MemoryRecord[];
+      close?: () => void;
+    };
+    try {
+      // search('') yields nothing, so a permissive token returns recent/strong records.
+      const q = query !== undefined && query.trim().length > 0 ? query.trim() : ' ';
+      const records = store.search(q, limit);
+      if (records.length === 0) {
+        console.log('no matching memory records');
+      } else {
+        for (const r of records) console.log(formatMemoryLine(r));
+      }
+      return 0;
+    } finally {
+      store.close?.();
+    }
+  } catch (err) {
+    return fail(err);
+  }
+}
+
+// ---------- lun approvals ----------
+
+export interface ApprovalsOptions {
+  resolve?: string;
+  approve?: boolean;
+  deny?: boolean;
+  by?: string;
+}
+
+export async function runApprovals(cwd: string, opts: ApprovalsOptions = {}): Promise<number> {
+  try {
+    const manifest = await loadProjectManifest(cwd);
+    if (!existsSync(approvalsDbPath(cwd))) {
+      console.log('no approvals queued yet');
+      return 0;
+    }
+    const policyMod = await loadModule('@lunaris/policy');
+    const QueueCtor = pick<new (dbPath: string) => {
+      list(projectId?: string, status?: ApprovalTicket['status']): ApprovalTicket[];
+      resolve(ticketId: string, approved: boolean, by: string, currentPlanEpoch?: number): ApprovalTicket | undefined;
+      close(): void;
+    }>(policyMod, ['SqliteApprovalQueue'], '@lunaris/policy SqliteApprovalQueue');
+    const queue = new QueueCtor(approvalsDbPath(cwd));
+    try {
+      if (opts.resolve !== undefined) {
+        if (opts.approve === undefined && opts.deny === undefined) {
+          throw new Error('--resolve requires --approve or --deny');
+        }
+        const approved = opts.approve === true && opts.deny !== true;
+        const by = opts.by ?? 'cli';
+        const resolved = queue.resolve(opts.resolve, approved, by);
+        if (resolved === undefined) {
+          console.error(`unknown ticket: ${opts.resolve}`);
+          return 1;
+        }
+        console.log(`${resolved.ticketId} → ${resolved.status}`);
+        return 0;
+      }
+      const pending = queue.list(manifest.project.id, 'pending');
+      if (pending.length === 0) {
+        console.log('no pending approvals');
+      } else {
+        for (const t of pending) console.log(formatApprovalLine(t));
+      }
+      return 0;
+    } finally {
+      queue.close();
+    }
   } catch (err) {
     return fail(err);
   }

@@ -14,10 +14,18 @@ import Fastify from 'fastify';
 import type { FastifyInstance, FastifyListenOptions } from 'fastify';
 import websocket from '@fastify/websocket';
 import fastifyStatic from '@fastify/static';
-import { loadManifest, SqliteEventStore } from '@lunaris/core';
-import type { EventStore, Goal, LunarisManifest } from '@lunaris/core';
+import { computeAnalytics, loadManifest, SqliteEventStore } from '@lunaris/core';
+import type {
+  ApprovalTicket,
+  AutonomyLevel,
+  EventStore,
+  Goal,
+  LunarisManifest,
+  MemoryRecord,
+  PolicyRule,
+} from '@lunaris/core';
 import { ProjectRegistry } from './registry.js';
-import { defaultGoalRunner } from './goal-runner.js';
+import { approvalsDbPath, defaultGoalRunner, memoryDbPath } from './goal-runner.js';
 import type { GoalRunner } from './goal-runner.js';
 
 const LOOPBACK_HOST = '127.0.0.1';
@@ -59,6 +67,51 @@ function packageVersion(): string {
 function defaultUiDistPath(): string {
   // compiled file lives at packages/daemon/dist/server.js → ../../ui/dist
   return join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'ui', 'dist');
+}
+
+/* ---------- Phase 2 package surfaces (value-level; bound loosely) ---------- */
+
+interface MemoryStoreLike {
+  search(query: string, limit?: number): MemoryRecord[];
+  entities(): unknown[];
+  relations(): unknown[];
+  close?(): void;
+}
+interface MemoryPkgLike {
+  SqliteMemoryStore: new (opts: { dbPath: string; projectId: string }) => MemoryStoreLike;
+}
+interface ApprovalQueueLike {
+  list(projectId?: string, status?: ApprovalTicket['status']): ApprovalTicket[];
+  resolve(ticketId: string, approved: boolean, by: string, currentPlanEpoch?: number): ApprovalTicket | undefined;
+  close(): void;
+}
+interface PolicyPkgLike {
+  loadPolicy: (
+    projectDir: string,
+    options?: { level?: AutonomyLevel },
+  ) => { level: AutonomyLevel; rules: PolicyRule[]; tightenWhenTainted: boolean; allowlistedHosts: string[] };
+  writeDefaultPolicy: (projectDir: string, level: AutonomyLevel, overwrite?: boolean) => string;
+  SqliteApprovalQueue: new (dbPath: string) => ApprovalQueueLike;
+}
+
+/** Open a read-only memory store for a project (returns undefined if the db/pkg is unavailable). */
+async function openMemory(projectRoot: string, projectId: string): Promise<MemoryStoreLike | undefined> {
+  const path = memoryDbPath(projectRoot);
+  if (!existsSync(path)) return undefined;
+  try {
+    const mod = (await import('@lunaris/memory')) as unknown as MemoryPkgLike;
+    return new mod.SqliteMemoryStore({ dbPath: path, projectId });
+  } catch {
+    return undefined;
+  }
+}
+
+async function loadPolicyPkg(): Promise<PolicyPkgLike | undefined> {
+  try {
+    return (await import('@lunaris/policy')) as unknown as PolicyPkgLike;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Wrap listen() so the daemon can never bind a non-loopback interface. */
@@ -214,6 +267,149 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
       const rawLimit = Number(req.query.limit ?? '100');
       const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 1000) : 100;
       return events.query({ projectId: project.id, kind: req.query.kind, limit });
+    },
+  );
+
+  // ---- Analytics ----
+
+  app.get<{ Params: { id: string }; Querystring: { since?: string } }>(
+    '/api/projects/:id/analytics',
+    async (req, reply) => {
+      const project = registry.get(req.params.id);
+      if (!project) {
+        return reply.code(404).send({ error: `unknown project: ${req.params.id}` });
+      }
+      const since = typeof req.query.since === 'string' && req.query.since.length > 0 ? req.query.since : undefined;
+      // Read off the live shared store (covers both in-memory and file-backed).
+      return computeAnalytics(events, project.id, since);
+    },
+  );
+
+  // ---- Memory: search / recent + graph ----
+
+  app.get<{ Params: { id: string }; Querystring: { q?: string; limit?: string } }>(
+    '/api/projects/:id/memory',
+    async (req, reply) => {
+      const project = registry.get(req.params.id);
+      if (!project) {
+        return reply.code(404).send({ error: `unknown project: ${req.params.id}` });
+      }
+      const store = await openMemory(project.root, project.id);
+      if (!store) return { records: [] };
+      try {
+        const rawLimit = Number(req.query.limit ?? '50');
+        const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 500) : 50;
+        // A query searches; an empty query returns the strongest recent records
+        // (search('', ...) yields nothing, so use a permissive token wildcard).
+        const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+        const records = q.length > 0 ? store.search(q, limit) : store.search(' ', limit);
+        return { records };
+      } finally {
+        store.close?.();
+      }
+    },
+  );
+
+  app.get<{ Params: { id: string } }>('/api/projects/:id/memory/graph', async (req, reply) => {
+    const project = registry.get(req.params.id);
+    if (!project) {
+      return reply.code(404).send({ error: `unknown project: ${req.params.id}` });
+    }
+    const store = await openMemory(project.root, project.id);
+    if (!store) return { entities: [], relations: [] };
+    try {
+      return { entities: store.entities(), relations: store.relations() };
+    } finally {
+      store.close?.();
+    }
+  });
+
+  // ---- Approvals ----
+
+  app.get<{ Params: { id: string }; Querystring: { status?: string } }>(
+    '/api/projects/:id/approvals',
+    async (req, reply) => {
+      const project = registry.get(req.params.id);
+      if (!project) {
+        return reply.code(404).send({ error: `unknown project: ${req.params.id}` });
+      }
+      const pkg = await loadPolicyPkg();
+      const dbPath = approvalsDbPath(project.root);
+      if (!pkg || !existsSync(dbPath)) return { tickets: [] };
+      const validStatuses = new Set(['pending', 'approved', 'denied', 'stale']);
+      const status =
+        typeof req.query.status === 'string' && validStatuses.has(req.query.status)
+          ? (req.query.status as ApprovalTicket['status'])
+          : undefined;
+      const queue = new pkg.SqliteApprovalQueue(dbPath);
+      try {
+        return { tickets: queue.list(project.id, status) };
+      } finally {
+        queue.close();
+      }
+    },
+  );
+
+  app.post<{ Params: { ticketId: string }; Body: { approved?: unknown; by?: unknown; projectId?: unknown } }>(
+    '/api/approvals/:ticketId/resolve',
+    async (req, reply) => {
+      const body = (req.body ?? {}) as { approved?: unknown; by?: unknown; projectId?: unknown };
+      if (typeof body.approved !== 'boolean') {
+        return reply.code(400).send({ error: 'body must be {"approved": true|false, "by"?: string, "projectId"?: string}' });
+      }
+      const pkg = await loadPolicyPkg();
+      if (!pkg) return reply.code(503).send({ error: '@lunaris/policy unavailable' });
+      const by = typeof body.by === 'string' && body.by.length > 0 ? body.by : 'ui';
+
+      // Approval dbs are per-project; resolve in the project whose queue holds it.
+      // If a projectId is supplied, target it; otherwise scan registered projects.
+      const candidates = typeof body.projectId === 'string'
+        ? registry.list().filter((p) => p.id === body.projectId)
+        : registry.list();
+      for (const project of candidates) {
+        const dbPath = approvalsDbPath(project.root);
+        if (!existsSync(dbPath)) continue;
+        const queue = new pkg.SqliteApprovalQueue(dbPath);
+        try {
+          const resolved = queue.resolve(req.params.ticketId, body.approved, by);
+          if (resolved !== undefined) return resolved;
+        } finally {
+          queue.close();
+        }
+      }
+      return reply.code(404).send({ error: `unknown ticket: ${req.params.ticketId}` });
+    },
+  );
+
+  // ---- Policy: read / update level + rules ----
+
+  app.get<{ Params: { id: string } }>('/api/projects/:id/policy', async (req, reply) => {
+    const project = registry.get(req.params.id);
+    if (!project) {
+      return reply.code(404).send({ error: `unknown project: ${req.params.id}` });
+    }
+    const pkg = await loadPolicyPkg();
+    if (!pkg) return reply.code(503).send({ error: '@lunaris/policy unavailable' });
+    return pkg.loadPolicy(project.root);
+  });
+
+  app.put<{ Params: { id: string }; Body: { level?: unknown } }>(
+    '/api/projects/:id/policy',
+    async (req, reply) => {
+      const project = registry.get(req.params.id);
+      if (!project) {
+        return reply.code(404).send({ error: `unknown project: ${req.params.id}` });
+      }
+      const body = (req.body ?? {}) as { level?: unknown };
+      const level = body.level;
+      if (level !== 0 && level !== 1 && level !== 2 && level !== 3) {
+        return reply.code(400).send({ error: 'body must be {"level": 0|1|2|3}' });
+      }
+      const pkg = await loadPolicyPkg();
+      if (!pkg) return reply.code(503).send({ error: '@lunaris/policy unavailable' });
+      // writeDefaultPolicy refuses to clobber; pass overwrite to set the level.
+      pkg.writeDefaultPolicy(project.root, level as AutonomyLevel, true);
+      return pkg.loadPolicy(project.root);
     },
   );
 

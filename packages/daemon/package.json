@@ -20,6 +20,8 @@
     "@lunaris/core": "workspace:*",
     "@lunaris/gateway": "workspace:*",
     "@lunaris/orchestrator": "workspace:*",
+    "@lunaris/memory": "workspace:*",
+    "@lunaris/policy": "workspace:*",
     "fastify": "^5.0.0",
     "@fastify/websocket": "^11.0.0",
     "@fastify/static": "^8.0.0"

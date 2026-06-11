@@ -24,7 +24,7 @@ export const ORCHESTRATOR_ROLE: RoleDef = {
     'message containing no tool calls: a clear summary of what was done, files changed,',
     'how it was verified, and any follow-ups or open issues.',
   ].join('\n'),
-  tools: ['read_file', 'write_file', 'list_dir', 'run_bash', 'spawn_subagent'],
+  tools: ['read_file', 'write_file', 'list_dir', 'run_bash', 'web_fetch', 'spawn_subagent'],
   maxIterations: 24,
 };
 

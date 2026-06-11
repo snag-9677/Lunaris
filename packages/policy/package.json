@@ -1,12 +1,10 @@
 {
-  "name": "@lunaris/cli",
+  "name": "@lunaris/policy",
   "version": "0.1.0",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "bin": {
-    "lun": "./dist/main.js"
-  },
+  "exports": { ".": "./dist/index.js" },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -14,12 +12,7 @@
   },
   "dependencies": {
     "@lunaris/core": "workspace:*",
-    "@lunaris/daemon": "workspace:*",
-    "@lunaris/gateway": "workspace:*",
-    "@lunaris/orchestrator": "workspace:*",
-    "@lunaris/memory": "workspace:*",
-    "@lunaris/policy": "workspace:*",
-    "commander": "^14.0.0"
+    "yaml": "^2.6.0"
   },
   "devDependencies": {
     "typescript": "^5.9.0",

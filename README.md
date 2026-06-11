@@ -2,7 +2,7 @@
 
 Local-first, autonomous, multi-project AI development harness. Full design: [LUNARIS_SPEC.md](LUNARIS_SPEC.md).
 
-**Status: Phase 1 MVP.** Working slice: per-project manifest (`lunaris.toml`), multi-provider model gateway (Anthropic / OpenAI / DeepSeek / Ollama / mock) with transactional budget ledger, orchestrator agent loop with confined tools + one-level subagent spawn, SQLite event spine, local daemon (`lunarisd`, 127.0.0.1 only) with WS event stream, Mission Control web UI, `lun` CLI.
+**Status: Phase 2.** Phase 1 (per-project manifest, multi-provider gateway + transactional budget ledger, orchestrator agent loop, SQLite event spine, `lunarisd` daemon 127.0.0.1-only + WS, Mission Control UI, `lun` CLI) plus Phase 2: graphified per-project memory (selective-retention gate, lexical-offline by default, guide-not-oracle advisory briefs, decay/prune, community clustering), autonomy policy engine (4 levels, allow/deny/queue rules, irreversible-action class, prompt-injection taint overlay), async approval queue with staleness guard, and analytics rollups (cost/tokens/goals/by-model) surfaced in CLI + UI panels. 136 tests.
 
 ## Quickstart
 
@@ -37,9 +37,11 @@ node packages/daemon/dist/main.js   # http://127.0.0.1:7340 (serves packages/ui/
 | `@lunaris/gateway` | ModelGateway: streaming adapters (Anthropic, OpenAI-compatible, Ollama, mock), pricing, transactional BudgetLedger |
 | `@lunaris/orchestrator` | AgentLoop: roles, confined tools (read/write/list/bash), subagent spawn, JSONL journal |
 | `@lunaris/daemon` | `lunarisd`: HTTP+WS API on 127.0.0.1:7340, project registry, async goal runner |
-| `@lunaris/cli` | `lun`: init, chat, status, events, daemon |
-| `@lunaris/ui` | Mission Control: project picker, chat, live event feed (Vite + React) |
+| `@lunaris/memory` | Graphified memory: SQLite store, selective-retention gate, lexical/embedding similarity, community clustering, decay/prune, advisory briefs |
+| `@lunaris/policy` | PDP: rule engine (allow/deny/queue), autonomy levels, irreversible-action class, taint tracker, SQLite approval queue |
+| `@lunaris/cli` | `lun`: init, chat, status, events, memory, analytics, approvals, daemon |
+| `@lunaris/ui` | Mission Control: project picker, chat, live feed + analytics / memory-graph / approvals panels (Vite + React) |
 
 ## Roadmap
 
-Spec §17: Phase 2 = memory graph + autonomy policy + dashboards; Phase 3 = optimizer + plugins + scheduler; Phase 4 = fleet/multi-user + lifecycle.
+Spec §17: ~~Phase 2 = memory graph + autonomy policy + dashboards~~ (done); Phase 3 = optimizer + plugins + scheduler; Phase 4 = fleet/multi-user + lifecycle.

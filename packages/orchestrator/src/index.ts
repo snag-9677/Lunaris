@@ -13,4 +13,6 @@ export {
   type AgentLoopOptions,
   type AgentRunOutcome,
   type ChatGateway,
+  type TaintSink,
+  type ApprovalSink,
 } from './loop.js';

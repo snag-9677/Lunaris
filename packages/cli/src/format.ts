@@ -3,7 +3,7 @@
  * Kept side-effect free so they are cheap to unit test; only type-level
  * imports from @lunaris/core (erased at runtime).
  */
-import type { EventEnvelope } from '@lunaris/core';
+import type { EventEnvelope, ProjectAnalytics } from '@lunaris/core';
 
 /** Minimal slice of an event used by formatting helpers (eases testing). */
 export type EventLike = Pick<EventEnvelope, 'ts' | 'kind' | 'payload'>;
@@ -125,6 +125,67 @@ export function normalizeResult(result: unknown): { status?: string; summary?: s
     return { status, summary };
   }
   return {};
+}
+
+/** Render a ProjectAnalytics rollup as plain text lines (one per array entry). */
+export function formatAnalytics(a: ProjectAnalytics): string[] {
+  const lines: string[] = [];
+  const total = a.goals.done + a.goals.failed;
+  const successRate = total > 0 ? Math.round((a.goals.done / total) * 100) : 0;
+  lines.push(`project:   ${a.projectId}`);
+  lines.push(`since:     ${a.since}`);
+  lines.push(
+    `goals:     ${a.goals.total} total · ${a.goals.done} done · ${a.goals.failed} failed · ${a.goals.running} running (${successRate}% success)`,
+  );
+  lines.push(
+    `llm:       ${a.llm.calls} calls · ${a.llm.inputTokens} in / ${a.llm.outputTokens} out tok · $${a.llm.costUsd.toFixed(4)}`,
+  );
+  lines.push(`tools:     ${a.tools.calls} calls · ${a.tools.failures} failures`);
+  if (a.byModel.length > 0) {
+    lines.push('by model:');
+    const nameW = Math.max(5, ...a.byModel.map((m) => m.model.length));
+    for (const m of a.byModel) {
+      lines.push(
+        `  ${m.model.padEnd(nameW)}  ${String(m.calls).padStart(4)} calls  ` +
+          `${String(m.inputTokens).padStart(7)} in  ${String(m.outputTokens).padStart(7)} out  $${m.costUsd.toFixed(4)}`,
+      );
+    }
+  }
+  return lines;
+}
+
+/** A minimal MemoryRecord view for one-line CLI rendering. */
+export interface MemoryRecordLike {
+  type?: string;
+  statement?: string;
+  confidence?: number;
+  strength?: number;
+  tainted?: boolean;
+}
+
+/** One-line rendering of a memory record. */
+export function formatMemoryLine(r: MemoryRecordLike): string {
+  const conf = typeof r.confidence === 'number' ? r.confidence.toFixed(2) : '?';
+  const str = typeof r.strength === 'number' ? r.strength.toFixed(2) : '?';
+  const taint = r.tainted ? ' (untrusted)' : '';
+  const type = (r.type ?? 'mem').padEnd(10);
+  return `${type} [conf ${conf} str ${str}]${taint} ${r.statement ?? ''}`;
+}
+
+/** A minimal ApprovalTicket view for one-line CLI rendering. */
+export interface ApprovalTicketLike {
+  ticketId?: string;
+  tool?: string;
+  reason?: string;
+  status?: string;
+  createdAt?: string;
+}
+
+/** One-line rendering of an approval ticket. */
+export function formatApprovalLine(t: ApprovalTicketLike): string {
+  const id = (t.ticketId ?? '?').slice(0, 12);
+  const status = (t.status ?? '?').padEnd(8);
+  return `${id}  ${status}  ${t.tool ?? '?'}  — ${t.reason ?? ''}`;
 }
 
 /** Normalize initManifest()'s return value into a list of created file paths. */
