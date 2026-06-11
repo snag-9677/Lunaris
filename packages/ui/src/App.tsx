@@ -1,4 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Play, RefreshCw } from 'lucide-react';
+import { authFetch, getAuthToken, getJson, login, setAuthToken, whoami, wsUrlWithTicket } from './api';
+import { applyEventToChats, newEntry, normalizeProjects, toFeedEvent } from './lib/feed';
+import type { ApprovalTicket, ChatsState, FeedEvent, Project, WsStatus } from './lib/types';
 import {
   AnalyticsPanel,
   ApprovalsPanel,
@@ -7,205 +11,16 @@ import {
   OptimizePanel,
   PluginsPanel,
   SystemPanel,
-} from './components/panels.js';
-import { authFetch, getAuthToken, login, setAuthToken, whoami, wsUrlWithTicket } from './api.js';
-
-type RightTab = 'feed' | 'analytics' | 'memory' | 'approvals' | 'optimize' | 'plugins' | 'automation' | 'system';
-
-/* ---------- types (mirror of @lunaris/core EventEnvelope; UI stays dep-free) ---------- */
-
-interface FeedEvent {
-  eventId: string;
-  ts: string;
-  projectId: string;
-  kind: string;
-  taskId?: string;
-  agentId?: string;
-  payload: unknown;
-}
-
-interface Project {
-  id: string;
-  name: string;
-}
-
-interface ChatEntry {
-  id: string;
-  role: 'user' | 'assistant';
-  text: string;
-  pending: boolean;
-  ts: string;
-}
-
-type ChatsState = Record<string, ChatEntry[]>;
-type WsStatus = 'connecting' | 'open' | 'closed';
-
-/* ---------- payload extraction helpers ---------- */
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null;
-}
-
-function pickString(obj: unknown, ...keys: string[]): string | undefined {
-  if (!isRecord(obj)) return undefined;
-  for (const k of keys) {
-    const v = obj[k];
-    if (typeof v === 'string' && v.length > 0) return v;
-  }
-  return undefined;
-}
-
-function pickNumber(obj: unknown, ...keys: string[]): number | undefined {
-  if (!isRecord(obj)) return undefined;
-  for (const k of keys) {
-    const v = obj[k];
-    if (typeof v === 'number' && Number.isFinite(v)) return v;
-  }
-  return undefined;
-}
-
-function extractModel(payload: unknown): string | undefined {
-  return (
-    pickString(payload, 'model') ??
-    pickString(isRecord(payload) ? payload['request'] : undefined, 'model')
-  );
-}
-
-function extractTool(payload: unknown, kind: string): string | undefined {
-  if (!kind.startsWith('tool')) return pickString(payload, 'tool');
-  return pickString(payload, 'tool', 'name');
-}
-
-function extractCost(payload: unknown): number | undefined {
-  return (
-    pickNumber(payload, 'costUsd', 'cost') ??
-    pickNumber(isRecord(payload) ? payload['usage'] : undefined, 'costUsd')
-  );
-}
-
-function extractText(payload: unknown): string | undefined {
-  return pickString(payload, 'text', 'summary', 'content', 'response', 'output', 'message');
-}
-
-function toFeedEvent(v: unknown): FeedEvent | null {
-  if (!isRecord(v)) return null;
-  const eventId = pickString(v, 'eventId');
-  const ts = pickString(v, 'ts');
-  const projectId = pickString(v, 'projectId');
-  const kind = pickString(v, 'kind');
-  if (!eventId || !ts || !projectId || !kind) return null;
-  return {
-    eventId,
-    ts,
-    projectId,
-    kind,
-    taskId: pickString(v, 'taskId'),
-    agentId: pickString(v, 'agentId'),
-    payload: v['payload'],
-  };
-}
-
-function normalizeProjects(data: unknown): Project[] {
-  const arr: unknown[] = Array.isArray(data)
-    ? data
-    : isRecord(data) && Array.isArray(data['projects'])
-      ? (data['projects'] as unknown[])
-      : [];
-  const out: Project[] = [];
-  for (const item of arr) {
-    const id = pickString(item, 'id', 'projectId');
-    if (!id) continue;
-    out.push({ id, name: pickString(item, 'name') ?? id });
-  }
-  return out;
-}
-
-function fmtTime(ts: string): string {
-  const d = new Date(ts);
-  if (Number.isNaN(d.getTime())) return ts;
-  return d.toLocaleTimeString(undefined, { hour12: false });
-}
-
-function newEntry(role: ChatEntry['role'], text: string, pending: boolean, ts: string): ChatEntry {
-  return { id: crypto.randomUUID(), role, text, pending, ts };
-}
-
-function hasRecentUserText(entries: ChatEntry[], text: string): boolean {
-  return entries.slice(-6).some((e) => e.role === 'user' && e.text === text);
-}
-
-/**
- * Transcript assembly (Phase 1, no token streaming):
- * - chat.message → append row
- * - goal.created → user row (deduped against optimistic local echo) + 'running…' placeholder
- * - llm.call     → resolves the placeholder when its payload carries final text
- * - task.end     → always resolves the placeholder (payload text/summary if present)
- */
-function applyEventToChats(chats: ChatsState, ev: FeedEvent): ChatsState {
-  const entries = chats[ev.projectId] ?? [];
-
-  if (ev.kind === 'chat.message') {
-    const text = extractText(ev.payload);
-    if (!text) return chats;
-    const role = pickString(ev.payload, 'role') === 'user' ? 'user' : 'assistant';
-    if (role === 'user' && hasRecentUserText(entries, text)) return chats;
-    return { ...chats, [ev.projectId]: [...entries, newEntry(role, text, false, ev.ts)] };
-  }
-
-  if (ev.kind === 'goal.created') {
-    const prompt = pickString(ev.payload, 'prompt');
-    const next = entries.slice();
-    if (prompt && !hasRecentUserText(entries, prompt)) {
-      next.push(newEntry('user', prompt, false, ev.ts));
-    }
-    if (!next.some((e) => e.pending)) {
-      next.push(newEntry('assistant', 'running…', true, ev.ts));
-    }
-    if (next.length === entries.length) return chats;
-    return { ...chats, [ev.projectId]: next };
-  }
-
-  if (ev.kind === 'task.end' || ev.kind === 'llm.call') {
-    const text = extractText(ev.payload);
-    const idx = entries.findIndex((e) => e.pending);
-    if (idx >= 0 && (text || ev.kind === 'task.end')) {
-      const next = entries.slice();
-      const cur = next[idx];
-      if (cur) {
-        next[idx] = { ...cur, text: text ?? '(task finished — no text in payload)', pending: false, ts: ev.ts };
-      }
-      return { ...chats, [ev.projectId]: next };
-    }
-    if (idx < 0 && ev.kind === 'task.end' && text) {
-      return { ...chats, [ev.projectId]: [...entries, newEntry('assistant', text, false, ev.ts)] };
-    }
-    return chats;
-  }
-
-  return chats;
-}
-
-/* ---------- components ---------- */
+} from './components/panels';
+import { ChatView } from './components/views/chat-view';
+import { ActivityView } from './components/views/activity-view';
+import { LoginGate } from './components/views/login-gate';
+import { NAV_ITEMS, Sidebar, type ViewId } from './components/views/sidebar';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Toaster } from '@/components/ui/sonner';
 
 const FEED_LIMIT = 500;
-
-function FeedRow({ ev }: { ev: FeedEvent }) {
-  const ns = ev.kind.split('.')[0] ?? 'event';
-  const model = extractModel(ev.payload);
-  const tool = extractTool(ev.payload, ev.kind);
-  const cost = extractCost(ev.payload);
-  return (
-    <div className="feed-row">
-      <span className={`badge ns-${ns}`}>{ev.kind}</span>
-      <span className="ts">{fmtTime(ev.ts)}</span>
-      {model && <span className="meta model">{model}</span>}
-      {tool && <span className="meta tool">{tool}</span>}
-      {cost !== undefined && <span className="meta cost">${cost.toFixed(4)}</span>}
-      {ev.taskId && <span className="meta task">{ev.taskId.slice(0, 8)}</span>}
-      <span className="meta project">{ev.projectId}</span>
-    </div>
-  );
-}
 
 export function App() {
   const [projects, setProjects] = useState<Project[]>([]);
@@ -215,12 +30,15 @@ export function App() {
   const [input, setInput] = useState('');
   const [wsStatus, setWsStatus] = useState<WsStatus>('connecting');
   const [error, setError] = useState<string | undefined>();
-  const [rightTab, setRightTab] = useState<RightTab>('feed');
-  const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const [view, setView] = useState<ViewId>('chat');
+  const [pendingApprovals, setPendingApprovals] = useState(0);
+  // Bumped to force the active panel to remount + reload on a refresh click.
+  const [refreshNonce, setRefreshNonce] = useState(0);
+  const [optimizeRunning, setOptimizeRunning] = useState(false);
 
   // ---- Auth (Phase 4) ----
   // authMode is detected from /api/whoami. When 'on' and we have no token, a
-  // login form gates the app. The token lives in memory (../api) and is sent on
+  // login form gates the app. The token lives in memory (./api) and is sent on
   // every fetch + the WS ticket. When 'off', no login is shown (current UX).
   const [authMode, setAuthMode] = useState<'off' | 'on' | 'unknown'>('unknown');
   const [authed, setAuthed] = useState(false);
@@ -337,12 +155,28 @@ export function App() {
     };
   }, [authed]);
 
-  const transcript = chats[selectedId] ?? [];
+  // Lightweight poll for the pending-approvals badge so the sidebar count stays
+  // current regardless of the active view (the Approvals panel owns the list).
+  const loadPendingCount = useCallback(async () => {
+    if (!authed || !selectedId) {
+      setPendingApprovals(0);
+      return;
+    }
+    try {
+      const data = await getJson<{ tickets: ApprovalTicket[] }>(
+        `/api/projects/${encodeURIComponent(selectedId)}/approvals?status=pending`,
+      );
+      setPendingApprovals(data.tickets.length);
+    } catch {
+      /* badge is best-effort; ignore errors */
+    }
+  }, [authed, selectedId]);
 
   useEffect(() => {
-    const el = transcriptRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [transcript.length]);
+    void loadPendingCount();
+  }, [loadPendingCount, refreshNonce, view]);
+
+  const transcript = useMemo(() => chats[selectedId] ?? [], [chats, selectedId]);
 
   const sendGoal = useCallback(async () => {
     const prompt = input.trim();
@@ -377,152 +211,120 @@ export function App() {
     }
   }, [input, selectedId]);
 
+  // The optimizer run lives on the Optimize panel; the header "run" action posts
+  // the same endpoint and signals the panel to refresh via the refresh nonce.
+  const runOptimizeFromHeader = useCallback(async () => {
+    if (!selectedId) return;
+    setOptimizeRunning(true);
+    try {
+      const res = await authFetch(`/api/projects/${encodeURIComponent(selectedId)}/optimize`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      if (!res.ok) throw new Error(`optimize → ${res.status}`);
+      setRefreshNonce((n) => n + 1);
+    } catch {
+      /* the Optimize panel surfaces its own errors; header action is a shortcut */
+    } finally {
+      setOptimizeRunning(false);
+    }
+  }, [selectedId]);
+
   // Login gate: only shown when auth is ON and we are not authenticated.
   if (authMode === 'on' && !authed) {
     return (
-      <div className="app">
-        <header className="header">
-          <h1>Lunaris · Mission Control</h1>
-        </header>
-        <div className="login-gate">
-          <form
-            className="login-form"
-            onSubmit={(e) => {
-              e.preventDefault();
-              void doLogin();
-            }}
-          >
-            <h2>sign in</h2>
-            <input
-              type="text"
-              value={loginUser}
-              placeholder="user"
-              autoComplete="username"
-              onChange={(e) => setLoginUser(e.target.value)}
-            />
-            <input
-              type="password"
-              value={loginPassword}
-              placeholder="password"
-              autoComplete="current-password"
-              onChange={(e) => setLoginPassword(e.target.value)}
-            />
-            {loginError && <div className="error">{loginError}</div>}
-            <button type="submit" disabled={loginUser.trim().length === 0}>
-              sign in
-            </button>
-          </form>
-        </div>
-      </div>
+      <>
+        <LoginGate
+          user={loginUser}
+          password={loginPassword}
+          error={loginError}
+          setUser={setLoginUser}
+          setPassword={setLoginPassword}
+          onSubmit={() => void doLogin()}
+        />
+        <Toaster />
+      </>
     );
   }
 
+  const selectedProject = projects.find((p) => p.id === selectedId);
+  const navItem = NAV_ITEMS.find((n) => n.id === view);
+  const viewTitle = navItem?.label ?? 'Chat';
+
   return (
-    <div className="app">
-      <header className="header">
-        <h1>Lunaris · Mission Control</h1>
-        <span className={`ws-dot ws-${wsStatus}`} title={`websocket: ${wsStatus}`} />
-        <span className="ws-label">{wsStatus}</span>
-        {principalName && (
-          <span className="who" title={principalRole ? `role: ${principalRole}` : undefined}>
-            {principalName}
-            {principalRole ? ` · ${principalRole}` : ''}
-          </span>
-        )}
-        {authMode === 'on' && authed && (
-          <button type="button" className="logout" onClick={doLogout}>
-            sign out
-          </button>
-        )}
-      </header>
+    <div className="flex h-screen w-screen overflow-hidden bg-background text-foreground">
+      <Sidebar
+        view={view}
+        onViewChange={setView}
+        projects={projects}
+        selectedId={selectedId}
+        onSelectProject={setSelectedId}
+        wsStatus={wsStatus}
+        pendingApprovals={pendingApprovals}
+        authMode={authMode}
+        authed={authed}
+        principalName={principalName}
+        principalRole={principalRole}
+        onLogout={doLogout}
+      />
 
-      <main className="main">
-        <section className="left">
-          <div className="picker">
-            <label htmlFor="project-select">project</label>
-            <select
-              id="project-select"
-              value={selectedId}
-              onChange={(e) => setSelectedId(e.target.value)}
-            >
-              {projects.length === 0 && <option value="">(no projects)</option>}
-              {projects.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name}
-                </option>
-              ))}
-            </select>
-            <button type="button" onClick={() => void loadProjects()}>
-              ↻
-            </button>
-          </div>
-          {error && <div className="error">{error}</div>}
-
-          <div className="transcript" ref={transcriptRef}>
-            {transcript.length === 0 && (
-              <div className="empty">no messages yet — send a goal below</div>
+      <div className="flex min-w-0 flex-1 flex-col">
+        {/* Header */}
+        <header className="flex h-14 shrink-0 items-center gap-3 border-b border-border px-5">
+          <h1 className="text-base font-semibold tracking-tight">{viewTitle}</h1>
+          {selectedProject && (
+            <Badge variant="secondary" className="font-mono text-xs">
+              {selectedProject.name}
+            </Badge>
+          )}
+          <div className="ml-auto flex items-center gap-2">
+            {view === 'optimize' && (
+              <Button size="sm" disabled={optimizeRunning || !selectedId} onClick={() => void runOptimizeFromHeader()}>
+                <Play /> {optimizeRunning ? 'running…' : 'Run optimizer'}
+              </Button>
             )}
-            {transcript.map((m) => (
-              <div key={m.id} className={`msg msg-${m.role}${m.pending ? ' msg-pending' : ''}`}>
-                <span className="msg-role">{m.role}</span>
-                <span className="msg-ts">{fmtTime(m.ts)}</span>
-                <div className="msg-text">{m.text}</div>
-              </div>
-            ))}
-          </div>
-
-          <form
-            className="composer"
-            onSubmit={(e) => {
-              e.preventDefault();
-              void sendGoal();
-            }}
-          >
-            <input
-              type="text"
-              value={input}
-              placeholder={selectedId ? 'describe a goal…' : 'select a project first'}
-              onChange={(e) => setInput(e.target.value)}
-              disabled={!selectedId}
-            />
-            <button type="submit" disabled={!selectedId || input.trim().length === 0}>
-              send
-            </button>
-          </form>
-        </section>
-
-        <section className="right">
-          <div className="tabs">
-            {(
-              ['feed', 'analytics', 'memory', 'approvals', 'optimize', 'plugins', 'automation', 'system'] as RightTab[]
-            ).map((tab) => (
-              <button
-                key={tab}
-                type="button"
-                className={`tab${rightTab === tab ? ' tab-active' : ''}`}
-                onClick={() => setRightTab(tab)}
+            {view !== 'chat' && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => (view === 'activity' ? setEvents([]) : setRefreshNonce((n) => n + 1))}
+                title={view === 'activity' ? 'Clear feed' : 'Refresh'}
               >
-                {tab}
-              </button>
-            ))}
+                <RefreshCw /> {view === 'activity' ? 'Clear' : 'Refresh'}
+              </Button>
+            )}
           </div>
-          {rightTab === 'feed' && (
-            <div className="feed">
-              {events.length === 0 && <div className="empty">waiting for events…</div>}
-              {events.map((ev) => (
-                <FeedRow key={ev.eventId} ev={ev} />
-              ))}
+        </header>
+
+        {/* Content */}
+        <main className="min-h-0 flex-1">
+          {error && view !== 'chat' && (
+            <div className="border-b border-destructive/30 bg-destructive/10 px-5 py-2 text-sm text-destructive">
+              {error}
             </div>
           )}
-          {rightTab === 'analytics' && <AnalyticsPanel projectId={selectedId} />}
-          {rightTab === 'memory' && <MemoryPanel projectId={selectedId} />}
-          {rightTab === 'approvals' && <ApprovalsPanel projectId={selectedId} />}
-          {rightTab === 'optimize' && <OptimizePanel projectId={selectedId} />}
-          {rightTab === 'plugins' && <PluginsPanel projectId={selectedId} />}
-          {rightTab === 'automation' && <AutomationPanel projectId={selectedId} />}
-          {rightTab === 'system' && <SystemPanel projectId={selectedId} />}
-        </section>
-      </main>
+          {view === 'chat' && (
+            <ChatView
+              transcript={transcript}
+              input={input}
+              setInput={setInput}
+              onSend={() => void sendGoal()}
+              canSend={!!selectedId}
+            />
+          )}
+          {view === 'activity' && <ActivityView events={events} />}
+          {view === 'analytics' && <AnalyticsPanel key={`an-${selectedId}-${refreshNonce}`} projectId={selectedId} />}
+          {view === 'memory' && <MemoryPanel key={`mem-${selectedId}-${refreshNonce}`} projectId={selectedId} />}
+          {view === 'approvals' && <ApprovalsPanel key={`ap-${selectedId}-${refreshNonce}`} projectId={selectedId} />}
+          {view === 'optimize' && <OptimizePanel key={`op-${selectedId}-${refreshNonce}`} projectId={selectedId} />}
+          {view === 'plugins' && <PluginsPanel key={`pl-${selectedId}-${refreshNonce}`} projectId={selectedId} />}
+          {view === 'automation' && <AutomationPanel key={`au-${selectedId}-${refreshNonce}`} projectId={selectedId} />}
+          {view === 'system' && <SystemPanel key={`sy-${selectedId}-${refreshNonce}`} projectId={selectedId} />}
+        </main>
+      </div>
+
+      <Toaster />
     </div>
   );
 }

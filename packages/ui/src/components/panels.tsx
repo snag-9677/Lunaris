@@ -1,145 +1,102 @@
 /**
- * Phase 2 Mission Control panels: Analytics, Memory (records + entity graph),
- * and an Approvals inbox. All dependency-free: plain React + fetch. They are
- * polled on mount/tab-activation and on an explicit refresh; the live WS feed
- * stays in App.tsx.
+ * Mission Control panels rebuilt with shadcn/ui primitives. Every fetch URL,
+ * method, body and response-handling path is preserved verbatim from the Phase
+ * 1-4 implementation; only the presentation changed. They poll on
+ * mount/view-activation and on an explicit refresh; the live WS feed stays in
+ * App.tsx. Action results/errors surface via sonner toasts.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { authFetch, getJson } from '../api.js';
+import {
+  ArrowRight,
+  CheckCircle2,
+  Download,
+  Inbox,
+  Package,
+  Plus,
+  Trash2,
+  XCircle,
+} from 'lucide-react';
+import { toast } from 'sonner';
+import { authFetch, getJson } from '../api';
+import { fmtBytes, fmtTokens, fmtUsd } from '../lib/feed';
+import type {
+  ApprovalTicket,
+  ConfigProposal,
+  DoctorReport,
+  LeaseInfo,
+  LoadedPlugin,
+  MemoryEntity,
+  MemoryRecord,
+  MemoryRelation,
+  OptimizerReport,
+  ProjectAnalytics,
+  QueuedGoal,
+  Schedule,
+  SnapshotInfo,
+  VersionInfo,
+} from '../lib/types';
+import { Badge, type BadgeProps } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { ScrollArea } from '@/components/ui/scroll-area';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
+import { cn } from '@/lib/utils';
 
-/* ---------- shared types (mirror @lunaris/core; UI stays dep-free) ---------- */
-
-interface ModelUsageRow {
-  model: string;
-  calls: number;
-  inputTokens: number;
-  outputTokens: number;
-  costUsd: number;
+function reportError(err: unknown): void {
+  toast.error(err instanceof Error ? err.message : String(err));
 }
 
-interface ProjectAnalytics {
-  projectId: string;
-  since: string;
-  goals: { total: number; done: number; failed: number; running: number };
-  llm: { calls: number; inputTokens: number; outputTokens: number; costUsd: number };
-  byModel: ModelUsageRow[];
-  tools: { calls: number; failures: number };
+/* ---------- small shared presentation helpers ---------- */
+
+function PanelEmpty({ children }: { children: React.ReactNode }) {
+  return <div className="px-1 py-6 text-center text-sm text-muted-foreground">{children}</div>;
 }
 
-interface MemoryRecord {
-  id: string;
-  type: string;
-  statement: string;
-  entities: string[];
-  confidence: number;
-  strength: number;
-  tainted?: boolean;
+function SectionTitle({ children, className }: { children: React.ReactNode; className?: string }) {
+  return (
+    <div className={cn('mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground', className)}>
+      {children}
+    </div>
+  );
 }
 
-interface MemoryEntity {
-  name: string;
-  kind?: string;
-  communityId?: number;
+/** A scrollable body shared by every panel so they fill the content area. */
+function PanelBody({ children }: { children: React.ReactNode }) {
+  return (
+    <ScrollArea className="h-full" viewportClassName="[&>div]:!block">
+      <div className="space-y-4 p-4">{children}</div>
+    </ScrollArea>
+  );
 }
 
-interface MemoryRelation {
-  from: string;
-  to: string;
-  rel: string;
-  recordId: string;
-}
+const memBadgeVariant: Record<string, BadgeProps['variant']> = {
+  semantic: 'info',
+  procedural: 'success',
+  episodic: 'warning',
+};
 
-interface ApprovalTicket {
-  ticketId: string;
-  projectId: string;
-  tool: string;
-  args: unknown;
-  reason: string;
-  createdAt: string;
-  status: 'pending' | 'approved' | 'denied' | 'stale';
-}
+const queueBadgeVariant: Record<string, BadgeProps['variant']> = {
+  queued: 'warning',
+  done: 'success',
+  leased: 'info',
+  failed: 'destructive',
+  dead: 'destructive',
+};
 
-/* ---------- Phase 3 shared types ---------- */
-
-interface OutcomeStats {
-  key: string;
-  taskClass: string;
-  role: string;
-  model: string;
-  n: number;
-  successes: number;
-  successRate: number;
-  avgCostUsd: number;
-}
-
-interface RoutingSuggestion {
-  taskClass: string;
-  recommendedModel: string;
-  rationale: string;
-  confidence: number;
-  basedOnN: number;
-}
-
-interface ConfigProposal {
-  id: string;
-  projectId: string;
-  kind: 'routing' | 'capability' | 'prompt';
-  title: string;
-  detail: string;
-  diff?: string;
-  status: 'pending' | 'approved' | 'rejected';
-  createdAt: string;
-  confidence: number;
-}
-
-interface OptimizerReport {
-  projectId: string;
-  generatedAt: string;
-  stats: OutcomeStats[];
-  routing: RoutingSuggestion[];
-  proposals: ConfigProposal[];
-  notes: string[];
-}
-
-interface LoadedPlugin {
-  manifest: { id: string; version: string; description?: string };
-  root: string;
-  enabled: boolean;
-}
-
-interface Schedule {
-  id: string;
-  projectId: string;
-  cron: string;
-  prompt?: string;
-  templateId?: string;
-  enabled: boolean;
-  nextRunAt?: string;
-}
-
-interface QueuedGoal {
-  id: string;
-  projectId: string;
-  prompt: string;
-  priority: number;
-  status: string;
-  source: string;
-  attempts: number;
-  maxAttempts: number;
-  goalId?: string;
-}
-
-/* ---------- formatting helpers (fetch helpers live in ../api) ---------- */
-
-function fmtUsd(n: number): string {
-  return `$${n.toFixed(n < 1 ? 4 : 2)}`;
-}
-
-function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
-  return String(n);
-}
+const doctorBadgeVariant: Record<string, BadgeProps['variant']> = {
+  ok: 'success',
+  behind: 'warning',
+  ahead: 'info',
+  missing: 'destructive',
+};
 
 /* ---------- Analytics ---------- */
 
@@ -171,19 +128,14 @@ export function AnalyticsPanel({ projectId }: { projectId: string }) {
     return closed > 0 ? Math.round((data.goals.done / closed) * 100) : 0;
   }, [data]);
 
+  if (!data && !error) return <PanelEmpty>loading…</PanelEmpty>;
+
   return (
-    <div className="panel">
-      <div className="panel-head">
-        <span>analytics</span>
-        <button type="button" onClick={() => void load()} disabled={loading}>
-          ↻
-        </button>
-      </div>
-      {error && <div className="error">{error}</div>}
-      {!data && !error && <div className="empty">loading…</div>}
+    <PanelBody>
+      {error && <ErrorNote message={error} />}
       {data && (
-        <div className="panel-body">
-          <div className="kpis">
+        <>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
             <Kpi label="goals" value={String(data.goals.total)} sub={`${data.goals.running} running`} />
             <Kpi label="success" value={`${successRate}%`} sub={`${data.goals.done}✓ ${data.goals.failed}✗`} />
             <Kpi label="cost" value={fmtUsd(data.llm.costUsd)} sub={`${data.llm.calls} calls`} />
@@ -194,47 +146,61 @@ export function AnalyticsPanel({ projectId }: { projectId: string }) {
             />
             <Kpi label="tools" value={String(data.tools.calls)} sub={`${data.tools.failures} failed`} />
           </div>
-          <table className="tbl">
-            <thead>
-              <tr>
-                <th>model</th>
-                <th className="num">calls</th>
-                <th className="num">in</th>
-                <th className="num">out</th>
-                <th className="num">cost</th>
-              </tr>
-            </thead>
-            <tbody>
-              {data.byModel.length === 0 && (
-                <tr>
-                  <td colSpan={5} className="empty">
-                    no model usage yet
-                  </td>
-                </tr>
-              )}
-              {data.byModel.map((m) => (
-                <tr key={m.model}>
-                  <td>{m.model}</td>
-                  <td className="num">{m.calls}</td>
-                  <td className="num">{fmtTokens(m.inputTokens)}</td>
-                  <td className="num">{fmtTokens(m.outputTokens)}</td>
-                  <td className="num">{fmtUsd(m.costUsd)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+          <Card>
+            <CardContent className="p-0">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>model</TableHead>
+                    <TableHead className="text-right">calls</TableHead>
+                    <TableHead className="text-right">in</TableHead>
+                    <TableHead className="text-right">out</TableHead>
+                    <TableHead className="text-right">cost</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {data.byModel.length === 0 && (
+                    <TableRow>
+                      <TableCell colSpan={5} className="text-center text-muted-foreground">
+                        no model usage yet
+                      </TableCell>
+                    </TableRow>
+                  )}
+                  {data.byModel.map((m) => (
+                    <TableRow key={m.model}>
+                      <TableCell className="font-mono text-xs">{m.model}</TableCell>
+                      <TableCell className="text-right tabular-nums">{m.calls}</TableCell>
+                      <TableCell className="text-right tabular-nums">{fmtTokens(m.inputTokens)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{fmtTokens(m.outputTokens)}</TableCell>
+                      <TableCell className="text-right font-mono text-xs tabular-nums">{fmtUsd(m.costUsd)}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+        </>
       )}
-    </div>
+    </PanelBody>
   );
 }
 
 function Kpi({ label, value, sub }: { label: string; value: string; sub?: string }) {
   return (
-    <div className="kpi">
-      <div className="kpi-label">{label}</div>
-      <div className="kpi-value">{value}</div>
-      {sub && <div className="kpi-sub">{sub}</div>}
+    <Card>
+      <CardContent className="p-3">
+        <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">{label}</div>
+        <div className="mt-1 text-2xl font-semibold text-primary">{value}</div>
+        {sub && <div className="mt-0.5 text-xs text-muted-foreground">{sub}</div>}
+      </CardContent>
+    </Card>
+  );
+}
+
+function ErrorNote({ message }: { message: string }) {
+  return (
+    <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+      {message}
     </div>
   );
 }
@@ -299,63 +265,76 @@ export function MemoryPanel({ projectId }: { projectId: string }) {
   }, [relations]);
 
   return (
-    <div className="panel">
-      <div className="panel-head">
-        <span>memory</span>
-        <form
-          className="mem-search"
-          onSubmit={(e) => {
-            e.preventDefault();
-            void load(query);
-          }}
-        >
-          <input
-            type="text"
-            value={query}
-            placeholder="search memory…"
-            onChange={(e) => setQuery(e.target.value)}
-          />
-          <button type="button" onClick={() => void load(query)}>
-            ↻
-          </button>
-        </form>
-      </div>
-      {error && <div className="error">{error}</div>}
-      <div className="panel-body mem-body">
-        <div className="mem-records">
-          <div className="mem-subhead">records ({records.length})</div>
-          {loaded && records.length === 0 && <div className="empty">no memory records</div>}
-          {records.map((r) => (
-            <div key={r.id} className="mem-record">
-              <div className="mem-record-top">
-                <span className={`badge mem-${r.type}`}>{r.type}</span>
-                <span className="mem-meta">conf {r.confidence.toFixed(2)}</span>
-                <span className="mem-meta">str {r.strength.toFixed(2)}</span>
-                {r.tainted && <span className="mem-taint">untrusted</span>}
-              </div>
-              <div className="mem-statement">{r.statement}</div>
-            </div>
-          ))}
+    <PanelBody>
+      <form
+        className="flex gap-2"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void load(query);
+        }}
+      >
+        <Input
+          value={query}
+          placeholder="search memory…"
+          onChange={(e) => setQuery(e.target.value)}
+          className="max-w-xs"
+        />
+        <Button type="submit" variant="outline" size="sm">
+          search
+        </Button>
+      </form>
+      {error && <ErrorNote message={error} />}
+      <div className="grid grid-cols-1 gap-5 lg:grid-cols-[1.3fr_1fr]">
+        <div>
+          <SectionTitle>records ({records.length})</SectionTitle>
+          {loaded && records.length === 0 && <PanelEmpty>no memory records</PanelEmpty>}
+          <div className="space-y-2">
+            {records.map((r) => (
+              <Card key={r.id}>
+                <CardContent className="p-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant={memBadgeVariant[r.type] ?? 'muted'}>{r.type}</Badge>
+                    <span className="text-xs text-muted-foreground">conf {r.confidence.toFixed(2)}</span>
+                    <span className="text-xs text-muted-foreground">str {r.strength.toFixed(2)}</span>
+                    {r.tainted && <span className="text-xs text-destructive">untrusted</span>}
+                  </div>
+                  <div className="mt-2 whitespace-pre-wrap break-words text-sm">{r.statement}</div>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
         </div>
-        <div className="mem-graph">
-          <div className="mem-subhead">entity graph ({entities.length})</div>
-          {loaded && communities.length === 0 && <div className="empty">no entities yet</div>}
-          {communities.map(([cid, ents]) => (
-            <div key={cid} className="community">
-              <div className="community-head">{cid === 'ungrouped' ? 'ungrouped' : `community ${cid.slice(1)}`}</div>
-              <div className="community-nodes">
-                {ents.map((e) => (
-                  <span key={e.name} className="node" title={e.kind}>
-                    {e.name}
-                    {relCount.has(e.name) && <span className="node-deg">{relCount.get(e.name)}</span>}
-                  </span>
-                ))}
+        <div>
+          <SectionTitle>entity graph ({entities.length})</SectionTitle>
+          {loaded && communities.length === 0 && <PanelEmpty>no entities yet</PanelEmpty>}
+          <div className="space-y-3">
+            {communities.map(([cid, ents]) => (
+              <div key={cid}>
+                <div className="mb-1.5 text-xs text-[oklch(0.78_0.12_300)]">
+                  {cid === 'ungrouped' ? 'ungrouped' : `community ${cid.slice(1)}`}
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {ents.map((e) => (
+                    <span
+                      key={e.name}
+                      title={e.kind}
+                      className="inline-flex items-center gap-1 rounded-full border border-border bg-secondary px-2.5 py-0.5 text-xs"
+                    >
+                      {e.name}
+                      {relCount.has(e.name) && (
+                        <span className="rounded-full bg-background px-1.5 text-[10px] text-primary">
+                          {relCount.get(e.name)}
+                        </span>
+                      )}
+                    </span>
+                  ))}
+                </div>
               </div>
-            </div>
-          ))}
+            ))}
+          </div>
         </div>
       </div>
-    </div>
+    </PanelBody>
   );
 }
 
@@ -397,8 +376,10 @@ export function ApprovalsPanel({ projectId }: { projectId: string }) {
         });
         if (!res.ok) throw new Error(`resolve → ${res.status}`);
         setTickets((prev) => prev.filter((t) => t.ticketId !== ticketId));
+        toast.success(approved ? 'Approved' : 'Denied');
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
+        reportError(err);
       } finally {
         setBusy(undefined);
       }
@@ -407,48 +388,51 @@ export function ApprovalsPanel({ projectId }: { projectId: string }) {
   );
 
   return (
-    <div className="panel">
-      <div className="panel-head">
-        <span>approvals inbox</span>
-        <button type="button" onClick={() => void load()}>
-          ↻
-        </button>
-      </div>
-      {error && <div className="error">{error}</div>}
-      <div className="panel-body">
-        {loaded && tickets.length === 0 && <div className="empty">no pending approvals</div>}
+    <PanelBody>
+      {error && <ErrorNote message={error} />}
+      {loaded && tickets.length === 0 && (
+        <PanelEmpty>
+          <Inbox className="mx-auto mb-2 h-6 w-6 opacity-50" />
+          no pending approvals
+        </PanelEmpty>
+      )}
+      <div className="space-y-3">
         {tickets.map((t) => (
-          <div key={t.ticketId} className="ticket">
-            <div className="ticket-top">
-              <span className="badge ns-tool">{t.tool}</span>
-              <span className="ticket-id">{t.ticketId.slice(0, 8)}</span>
-            </div>
-            <div className="ticket-reason">{t.reason}</div>
-            {t.args !== undefined && t.args !== null && (
-              <pre className="ticket-args">{JSON.stringify(t.args)}</pre>
-            )}
-            <div className="ticket-actions">
-              <button
-                type="button"
-                className="approve"
-                disabled={busy === t.ticketId}
-                onClick={() => void resolve(t.ticketId, true)}
-              >
-                approve
-              </button>
-              <button
-                type="button"
-                className="deny"
-                disabled={busy === t.ticketId}
-                onClick={() => void resolve(t.ticketId, false)}
-              >
-                deny
-              </button>
-            </div>
-          </div>
+          <Card key={t.ticketId}>
+            <CardContent className="p-3">
+              <div className="flex items-center gap-2">
+                <Badge variant="warning">{t.tool}</Badge>
+                <span className="font-mono text-xs text-muted-foreground">{t.ticketId.slice(0, 8)}</span>
+              </div>
+              <div className="mt-2 text-sm">{t.reason}</div>
+              {t.args !== undefined && t.args !== null && (
+                <pre className="mt-2 overflow-x-auto rounded-md bg-secondary px-2.5 py-2 font-mono text-xs text-muted-foreground">
+                  {JSON.stringify(t.args)}
+                </pre>
+              )}
+              <div className="mt-3 flex gap-2">
+                <Button
+                  variant="success"
+                  size="sm"
+                  disabled={busy === t.ticketId}
+                  onClick={() => void resolve(t.ticketId, true)}
+                >
+                  <CheckCircle2 /> approve
+                </Button>
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  disabled={busy === t.ticketId}
+                  onClick={() => void resolve(t.ticketId, false)}
+                >
+                  <XCircle /> deny
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
         ))}
       </div>
-    </div>
+    </PanelBody>
   );
 }
 
@@ -492,8 +476,10 @@ export function OptimizePanel({ projectId }: { projectId: string }) {
       setReport(r);
       setProposals(r.proposals);
       setError(undefined);
+      toast.success(`Optimizer ran — ${r.proposals.length} proposal(s)`);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      reportError(err);
     } finally {
       setRunning(false);
     }
@@ -511,8 +497,10 @@ export function OptimizePanel({ projectId }: { projectId: string }) {
         if (!res.ok) throw new Error(`resolve → ${res.status}`);
         const updated = (await res.json()) as ConfigProposal;
         setProposals((prev) => prev.map((p) => (p.id === id ? updated : p)));
+        toast.success(approved ? 'Proposal approved' : 'Proposal rejected');
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
+        reportError(err);
       } finally {
         setBusy(undefined);
       }
@@ -521,105 +509,115 @@ export function OptimizePanel({ projectId }: { projectId: string }) {
   );
 
   return (
-    <div className="panel">
-      <div className="panel-head">
-        <span>optimize</span>
-        <button type="button" onClick={() => void runOptimize()} disabled={running || !projectId}>
-          {running ? 'running…' : 'run optimizer'}
-        </button>
-        <button type="button" onClick={() => void loadProposals()}>
-          ↻
-        </button>
-      </div>
-      {error && <div className="error">{error}</div>}
-      <div className="panel-body">
-        {report && (
-          <>
-            <div className="mem-subhead">success rate by model</div>
-            <table className="tbl">
-              <thead>
-                <tr>
-                  <th>class/role/model</th>
-                  <th className="num">n</th>
-                  <th className="num">success</th>
-                  <th className="num">cost</th>
-                </tr>
-              </thead>
-              <tbody>
-                {report.stats.length === 0 && (
-                  <tr>
-                    <td colSpan={4} className="empty">
-                      no task outcomes yet
-                    </td>
-                  </tr>
-                )}
-                {report.stats.map((s) => (
-                  <tr key={s.key}>
-                    <td>{`${s.taskClass}/${s.role}/${s.model}`}</td>
-                    <td className="num">{`${s.successes}/${s.n}`}</td>
-                    <td className="num">{`${(s.successRate * 100).toFixed(0)}%`}</td>
-                    <td className="num">{fmtUsd(s.avgCostUsd)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+    <PanelBody>
+      {error && <ErrorNote message={error} />}
+      {report && (
+        <>
+          <SectionTitle>success rate by model</SectionTitle>
+          <Card>
+            <CardContent className="p-0">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>class/role/model</TableHead>
+                    <TableHead className="text-right">n</TableHead>
+                    <TableHead className="text-right">success</TableHead>
+                    <TableHead className="text-right">cost</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {report.stats.length === 0 && (
+                    <TableRow>
+                      <TableCell colSpan={4} className="text-center text-muted-foreground">
+                        no task outcomes yet
+                      </TableCell>
+                    </TableRow>
+                  )}
+                  {report.stats.map((s) => (
+                    <TableRow key={s.key}>
+                      <TableCell className="font-mono text-xs">{`${s.taskClass}/${s.role}/${s.model}`}</TableCell>
+                      <TableCell className="text-right tabular-nums">{`${s.successes}/${s.n}`}</TableCell>
+                      <TableCell className="text-right tabular-nums">{`${(s.successRate * 100).toFixed(0)}%`}</TableCell>
+                      <TableCell className="text-right font-mono text-xs tabular-nums">{fmtUsd(s.avgCostUsd)}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
 
-            <div className="mem-subhead" style={{ marginTop: 14 }}>
-              routing suggestions
-            </div>
-            {report.routing.length === 0 && <div className="empty">none yet — need more pulls per arm</div>}
+          <SectionTitle className="mt-1">routing suggestions</SectionTitle>
+          {report.routing.length === 0 && <PanelEmpty>none yet — need more pulls per arm</PanelEmpty>}
+          <div className="space-y-2">
             {report.routing.map((s) => (
-              <div key={s.taskClass} className="suggestion">
-                <div className="suggestion-top">
-                  <span className="badge ns-llm">{s.taskClass}</span>
-                  <span className="suggestion-arrow">→</span>
-                  <span className="meta model">{s.recommendedModel}</span>
-                  <span className="mem-meta">conf {(s.confidence * 100).toFixed(0)}% · n={s.basedOnN}</span>
-                </div>
-                <div className="suggestion-why">{s.rationale}</div>
-              </div>
-            ))}
-
-            {report.notes.length > 0 && (
-              <div className="opt-notes">
-                {report.notes.map((n, i) => (
-                  <div key={i} className="opt-note">
-                    {n}
+              <Card key={s.taskClass}>
+                <CardContent className="p-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant="info">{s.taskClass}</Badge>
+                    <ArrowRight className="h-3.5 w-3.5 text-muted-foreground" />
+                    <span className="font-mono text-xs text-info">{s.recommendedModel}</span>
+                    <span className="text-xs text-muted-foreground">
+                      conf {(s.confidence * 100).toFixed(0)}% · n={s.basedOnN}
+                    </span>
                   </div>
-                ))}
-              </div>
-            )}
-          </>
-        )}
-
-        <div className="mem-subhead" style={{ marginTop: report ? 14 : 0 }}>
-          proposals ({proposals.length})
-        </div>
-        {proposals.length === 0 && <div className="empty">no proposals — run the optimizer</div>}
-        {proposals.map((p) => (
-          <div key={p.id} className="ticket">
-            <div className="ticket-top">
-              <span className={`badge ns-${p.kind === 'routing' ? 'llm' : 'goal'}`}>{p.kind}</span>
-              <span className="ticket-id">{p.status}</span>
-              <span className="mem-meta">conf {(p.confidence * 100).toFixed(0)}%</span>
-            </div>
-            <div className="ticket-reason">{p.title}</div>
-            <div className="proposal-detail">{p.detail}</div>
-            {p.diff && <pre className="ticket-args">{p.diff}</pre>}
-            {p.status === 'pending' && (
-              <div className="ticket-actions">
-                <button type="button" className="approve" disabled={busy === p.id} onClick={() => void resolve(p.id, true)}>
-                  approve
-                </button>
-                <button type="button" className="deny" disabled={busy === p.id} onClick={() => void resolve(p.id, false)}>
-                  reject
-                </button>
-              </div>
-            )}
+                  <div className="mt-1.5 whitespace-pre-wrap break-words text-sm text-muted-foreground">
+                    {s.rationale}
+                  </div>
+                </CardContent>
+              </Card>
+            ))}
           </div>
+
+          {report.notes.length > 0 && (
+            <div className="space-y-1 border-t border-border pt-3">
+              {report.notes.map((n, i) => (
+                <div key={i} className="text-xs text-muted-foreground">
+                  {n}
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+
+      <SectionTitle className="mt-1">proposals ({proposals.length})</SectionTitle>
+      {proposals.length === 0 && <PanelEmpty>no proposals — run the optimizer</PanelEmpty>}
+      <div className="space-y-3">
+        {proposals.map((p) => (
+          <Card key={p.id}>
+            <CardContent className="p-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge variant={p.kind === 'routing' ? 'info' : 'default'}>{p.kind}</Badge>
+                <span className="text-xs text-muted-foreground">{p.status}</span>
+                <span className="text-xs text-muted-foreground">conf {(p.confidence * 100).toFixed(0)}%</span>
+              </div>
+              <div className="mt-2 text-sm">{p.title}</div>
+              <div className="mt-1 whitespace-pre-wrap break-words text-sm text-muted-foreground">{p.detail}</div>
+              {p.diff && (
+                <pre className="mt-2 overflow-x-auto rounded-md bg-secondary px-2.5 py-2 font-mono text-xs text-muted-foreground">
+                  {p.diff}
+                </pre>
+              )}
+              {p.status === 'pending' && (
+                <div className="mt-3 flex gap-2">
+                  <Button variant="success" size="sm" disabled={busy === p.id} onClick={() => void resolve(p.id, true)}>
+                    <CheckCircle2 /> approve
+                  </Button>
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    disabled={busy === p.id}
+                    onClick={() => void resolve(p.id, false)}
+                  >
+                    <XCircle /> reject
+                  </Button>
+                </div>
+              )}
+            </CardContent>
+          </Card>
         ))}
       </div>
-    </div>
+    </PanelBody>
   );
 }
 
@@ -660,8 +658,10 @@ export function PluginsPanel({ projectId }: { projectId: string }) {
         if (!res.ok) throw new Error(`${action} → ${res.status}`);
         const data = (await res.json()) as { plugins: LoadedPlugin[] };
         setPlugins(data.plugins);
+        toast.success(`${id} ${enable ? 'enabled' : 'disabled'}`);
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
+        reportError(err);
       } finally {
         setBusy(undefined);
       }
@@ -670,35 +670,36 @@ export function PluginsPanel({ projectId }: { projectId: string }) {
   );
 
   return (
-    <div className="panel">
-      <div className="panel-head">
-        <span>plugins</span>
-        <button type="button" onClick={() => void load()}>
-          ↻
-        </button>
-      </div>
-      {error && <div className="error">{error}</div>}
-      <div className="panel-body">
-        {loaded && plugins.length === 0 && <div className="empty">no plugins under .lunaris/plugins</div>}
+    <PanelBody>
+      {error && <ErrorNote message={error} />}
+      {loaded && plugins.length === 0 && <PanelEmpty>no plugins under .lunaris/plugins</PanelEmpty>}
+      <div className="space-y-2">
         {plugins.map((p) => (
-          <div key={p.manifest.id} className="plugin-row">
-            <div className="plugin-info">
-              <span className="plugin-id">{p.manifest.id}</span>
-              <span className="mem-meta">v{p.manifest.version}</span>
-              {p.manifest.description && <span className="plugin-desc">{p.manifest.description}</span>}
-            </div>
-            <button
-              type="button"
-              className={p.enabled ? 'toggle on' : 'toggle off'}
-              disabled={busy === p.manifest.id}
-              onClick={() => void toggle(p.manifest.id, !p.enabled)}
-            >
-              {p.enabled ? 'enabled' : 'disabled'}
-            </button>
-          </div>
+          <Card key={p.manifest.id}>
+            <CardContent className="flex items-center gap-3 p-3">
+              <Package className="h-4 w-4 shrink-0 text-muted-foreground" />
+              <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-medium">{p.manifest.id}</span>
+                  <span className="text-xs text-muted-foreground">v{p.manifest.version}</span>
+                </div>
+                {p.manifest.description && (
+                  <span className="truncate text-xs text-muted-foreground">{p.manifest.description}</span>
+                )}
+              </div>
+              <Button
+                variant={p.enabled ? 'success' : 'outline'}
+                size="sm"
+                disabled={busy === p.manifest.id}
+                onClick={() => void toggle(p.manifest.id, !p.enabled)}
+              >
+                {p.enabled ? 'enabled' : 'disabled'}
+              </Button>
+            </CardContent>
+          </Card>
         ))}
       </div>
-    </div>
+    </PanelBody>
   );
 }
 
@@ -744,8 +745,10 @@ export function AutomationPanel({ projectId }: { projectId: string }) {
       if (!res.ok) throw new Error(`add schedule → ${res.status}`);
       setPrompt('');
       await load();
+      toast.success('Schedule added');
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      reportError(err);
     }
   }, [projectId, cron, prompt, load]);
 
@@ -757,116 +760,84 @@ export function AutomationPanel({ projectId }: { projectId: string }) {
         });
         if (!res.ok) throw new Error(`remove → ${res.status}`);
         setSchedules((prev) => prev.filter((s) => s.id !== id));
+        toast.success('Schedule removed');
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
+        reportError(err);
       }
     },
     [projectId],
   );
 
   return (
-    <div className="panel">
-      <div className="panel-head">
-        <span>automation</span>
-        <button type="button" onClick={() => void load()}>
-          ↻
-        </button>
-      </div>
-      {error && <div className="error">{error}</div>}
-      <div className="panel-body">
-        <div className="mem-subhead">schedules ({schedules.length})</div>
-        <form
-          className="sched-add"
-          onSubmit={(e) => {
-            e.preventDefault();
-            void addSchedule();
-          }}
+    <PanelBody>
+      {error && <ErrorNote message={error} />}
+      <SectionTitle>schedules ({schedules.length})</SectionTitle>
+      <form
+        className="flex flex-col gap-2 sm:flex-row"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void addSchedule();
+        }}
+      >
+        <Input
+          value={cron}
+          placeholder="cron (5-field)"
+          onChange={(e) => setCron(e.target.value)}
+          className="font-mono sm:w-40 sm:shrink-0"
+        />
+        <Input
+          value={prompt}
+          placeholder="prompt for the scheduled goal"
+          onChange={(e) => setPrompt(e.target.value)}
+          className="sm:flex-1"
+        />
+        <Button
+          type="submit"
+          size="sm"
+          disabled={!projectId || cron.trim().length === 0 || prompt.trim().length === 0}
         >
-          <input type="text" value={cron} placeholder="cron (5-field)" onChange={(e) => setCron(e.target.value)} />
-          <input
-            type="text"
-            value={prompt}
-            placeholder="prompt for the scheduled goal"
-            onChange={(e) => setPrompt(e.target.value)}
-          />
-          <button type="submit" disabled={!projectId || cron.trim().length === 0 || prompt.trim().length === 0}>
-            add
-          </button>
-        </form>
-        {loaded && schedules.length === 0 && <div className="empty">no schedules</div>}
+          <Plus /> add
+        </Button>
+      </form>
+      {loaded && schedules.length === 0 && <PanelEmpty>no schedules</PanelEmpty>}
+      <div className="space-y-2">
         {schedules.map((s) => (
-          <div key={s.id} className="sched-row">
-            <div className="sched-info">
-              <span className={`badge ${s.enabled ? 'ns-task' : ''}`}>{s.cron}</span>
-              <span className="sched-prompt">{s.prompt ?? (s.templateId ? `template:${s.templateId}` : '')}</span>
-              {s.nextRunAt && <span className="mem-meta">next {s.nextRunAt}</span>}
-            </div>
-            <button type="button" className="deny" onClick={() => void removeSchedule(s.id)}>
-              remove
-            </button>
-          </div>
-        ))}
-
-        <div className="mem-subhead" style={{ marginTop: 14 }}>
-          goal queue ({goals.length})
-        </div>
-        {loaded && goals.length === 0 && <div className="empty">queue is empty</div>}
-        {goals.map((g) => (
-          <div key={g.id} className="queue-row">
-            <span className={`badge queue-${g.status}`}>{g.status}</span>
-            <span className="mem-meta">p{g.priority}</span>
-            <span className="mem-meta">{g.source}</span>
-            <span className="queue-prompt">{g.prompt}</span>
-          </div>
+          <Card key={s.id}>
+            <CardContent className="flex items-center gap-3 p-3">
+              <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+                <Badge variant={s.enabled ? 'success' : 'muted'} className="font-mono">
+                  {s.cron}
+                </Badge>
+                <span className="truncate text-sm">
+                  {s.prompt ?? (s.templateId ? `template:${s.templateId}` : '')}
+                </span>
+                {s.nextRunAt && <span className="text-xs text-muted-foreground">next {s.nextRunAt}</span>}
+              </div>
+              <Button variant="destructive" size="sm" onClick={() => void removeSchedule(s.id)}>
+                <Trash2 /> remove
+              </Button>
+            </CardContent>
+          </Card>
         ))}
       </div>
-    </div>
+
+      <SectionTitle className="mt-1">goal queue ({goals.length})</SectionTitle>
+      {loaded && goals.length === 0 && <PanelEmpty>queue is empty</PanelEmpty>}
+      <div className="space-y-2">
+        {goals.map((g) => (
+          <Card key={g.id}>
+            <CardContent className="flex items-center gap-2 p-3">
+              <Badge variant={queueBadgeVariant[g.status] ?? 'muted'}>{g.status}</Badge>
+              <span className="text-xs text-muted-foreground">p{g.priority}</span>
+              <span className="text-xs text-muted-foreground">{g.source}</span>
+              <span className="min-w-0 flex-1 truncate text-sm">{g.prompt}</span>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+    </PanelBody>
   );
-}
-
-/* ---------- Phase 4 shared types ---------- */
-
-interface VersionInfo {
-  harness: string;
-  schemaVersions: Record<string, number>;
-}
-
-interface StoreReport {
-  store: string;
-  path: string;
-  present: boolean;
-  version: number | null;
-  expected: number | null;
-  status: 'ok' | 'behind' | 'ahead' | 'missing';
-}
-
-interface DoctorReport {
-  harness: string;
-  stores: StoreReport[];
-}
-
-interface SnapshotInfo {
-  id: string;
-  projectId: string;
-  createdAt: string;
-  bytes: number;
-  kind: 'full' | 'pre-op';
-  path: string;
-}
-
-interface LeaseInfo {
-  repoId: string;
-  holderId: string;
-  nodeId: string;
-  epoch: number;
-  acquiredAt: string;
-  heartbeatAt: string;
-}
-
-function fmtBytes(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}MB`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}kB`;
-  return `${n}B`;
 }
 
 /* ---------- System: version + schema doctor, lease, snapshots, export ---------- */
@@ -878,7 +849,6 @@ export function SystemPanel({ projectId }: { projectId: string }) {
   const [snapshots, setSnapshots] = useState<SnapshotInfo[]>([]);
   const [error, setError] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
-  const [note, setNote] = useState<string | undefined>();
 
   const load = useCallback(async () => {
     try {
@@ -916,7 +886,6 @@ export function SystemPanel({ projectId }: { projectId: string }) {
   const createSnapshot = useCallback(async () => {
     if (!projectId) return;
     setBusy(true);
-    setNote(undefined);
     try {
       const res = await authFetch(`/api/projects/${encodeURIComponent(projectId)}/snapshot`, {
         method: 'POST',
@@ -926,9 +895,10 @@ export function SystemPanel({ projectId }: { projectId: string }) {
       if (!res.ok) throw new Error(`snapshot → ${res.status}`);
       const info = (await res.json()) as SnapshotInfo;
       setSnapshots((prev) => [info, ...prev]);
-      setNote(`created snapshot ${info.id.slice(0, 12)}`);
+      toast.success(`Created snapshot ${info.id.slice(0, 12)}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      reportError(err);
     } finally {
       setBusy(false);
     }
@@ -938,7 +908,6 @@ export function SystemPanel({ projectId }: { projectId: string }) {
     async (snapshotId: string) => {
       if (!projectId) return;
       setBusy(true);
-      setNote(undefined);
       try {
         const res = await authFetch(`/api/projects/${encodeURIComponent(projectId)}/restore`, {
           method: 'POST',
@@ -947,9 +916,10 @@ export function SystemPanel({ projectId }: { projectId: string }) {
         });
         if (!res.ok) throw new Error(`restore → ${res.status}`);
         const result = (await res.json()) as { restored: string[]; dryRun: boolean };
-        setNote(`dry run: would restore ${result.restored.length} file(s)`);
+        toast.success(`Dry run: would restore ${result.restored.length} file(s)`);
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
+        reportError(err);
       } finally {
         setBusy(false);
       }
@@ -960,7 +930,6 @@ export function SystemPanel({ projectId }: { projectId: string }) {
   const exportBundle = useCallback(async () => {
     if (!projectId) return;
     setBusy(true);
-    setNote(undefined);
     try {
       const res = await authFetch(`/api/projects/${encodeURIComponent(projectId)}/export`, {
         method: 'POST',
@@ -969,96 +938,93 @@ export function SystemPanel({ projectId }: { projectId: string }) {
       });
       if (!res.ok) throw new Error(`export → ${res.status}`);
       const out = (await res.json()) as { outPath: string };
-      setNote(`exported bundle → ${out.outPath}`);
+      toast.success(`Exported bundle → ${out.outPath}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      reportError(err);
     } finally {
       setBusy(false);
     }
   }, [projectId]);
 
   return (
-    <div className="panel">
-      <div className="panel-head">
-        <span>system</span>
-        <button type="button" onClick={() => void load()} disabled={busy}>
-          ↻
-        </button>
+    <PanelBody>
+      {error && <ErrorNote message={error} />}
+      <SectionTitle>harness {version ? `v${version.harness}` : '…'}</SectionTitle>
+      <Card>
+        <CardContent className="p-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>store</TableHead>
+                <TableHead className="text-right">version</TableHead>
+                <TableHead className="text-right">expected</TableHead>
+                <TableHead>status</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {(!doctor || doctor.stores.length === 0) && (
+                <TableRow>
+                  <TableCell colSpan={4} className="text-center text-muted-foreground">
+                    no stores found
+                  </TableCell>
+                </TableRow>
+              )}
+              {doctor?.stores.map((s) => (
+                <TableRow key={s.store}>
+                  <TableCell className="font-mono text-xs">{s.store}</TableCell>
+                  <TableCell className="text-right tabular-nums">{s.version ?? '-'}</TableCell>
+                  <TableCell className="text-right tabular-nums">{s.expected ?? '-'}</TableCell>
+                  <TableCell>
+                    <Badge variant={doctorBadgeVariant[s.status] ?? 'muted'}>{s.status}</Badge>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
+
+      <SectionTitle className="mt-1">lease</SectionTitle>
+      {lease ? (
+        <div className="font-mono text-sm">
+          holder {lease.holderId.slice(0, 12)} · node {lease.nodeId} · epoch {lease.epoch}
+        </div>
+      ) : (
+        <PanelEmpty>no live lease for this project</PanelEmpty>
+      )}
+
+      <SectionTitle className="mt-1">snapshots ({snapshots.length})</SectionTitle>
+      <div className="flex gap-2">
+        <Button variant="success" size="sm" disabled={busy || !projectId} onClick={() => void createSnapshot()}>
+          <Plus /> create snapshot
+        </Button>
+        <Button variant="outline" size="sm" disabled={busy || !projectId} onClick={() => void exportBundle()}>
+          <Download /> export bundle
+        </Button>
       </div>
-      {error && <div className="error">{error}</div>}
-      {note && <div className="sys-note">{note}</div>}
-      <div className="panel-body">
-        <div className="mem-subhead">harness {version ? `v${version.harness}` : '…'}</div>
-        <table className="tbl">
-          <thead>
-            <tr>
-              <th>store</th>
-              <th className="num">version</th>
-              <th className="num">expected</th>
-              <th>status</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(!doctor || doctor.stores.length === 0) && (
-              <tr>
-                <td colSpan={4} className="empty">
-                  no stores found
-                </td>
-              </tr>
-            )}
-            {doctor?.stores.map((s) => (
-              <tr key={s.store}>
-                <td>{s.store}</td>
-                <td className="num">{s.version ?? '-'}</td>
-                <td className="num">{s.expected ?? '-'}</td>
-                <td>
-                  <span className={`badge doctor-${s.status}`}>{s.status}</span>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-
-        <div className="mem-subhead" style={{ marginTop: 14 }}>
-          lease
-        </div>
-        {lease ? (
-          <div className="sys-lease">
-            holder {lease.holderId.slice(0, 12)} · node {lease.nodeId} · epoch {lease.epoch}
-          </div>
-        ) : (
-          <div className="empty">no live lease for this project</div>
-        )}
-
-        <div className="mem-subhead" style={{ marginTop: 14 }}>
-          snapshots ({snapshots.length})
-        </div>
-        <div className="sys-actions">
-          <button type="button" className="approve" disabled={busy || !projectId} onClick={() => void createSnapshot()}>
-            create snapshot
-          </button>
-          <button type="button" disabled={busy || !projectId} onClick={() => void exportBundle()}>
-            export bundle
-          </button>
-        </div>
-        {snapshots.length === 0 && <div className="empty">no snapshots</div>}
+      {snapshots.length === 0 && <PanelEmpty>no snapshots</PanelEmpty>}
+      <div className="space-y-2">
         {snapshots.map((s) => (
-          <div key={s.id} className="sys-snap">
-            <span className={`badge ns-task`}>{s.kind}</span>
-            <span className="sys-snap-id">{s.id.slice(0, 12)}</span>
-            <span className="mem-meta">{fmtBytes(s.bytes)}</span>
-            <span className="mem-meta">{s.createdAt}</span>
-            <button
-              type="button"
-              className="sys-restore"
-              disabled={busy}
-              onClick={() => void restoreDryRun(s.id)}
-            >
-              restore (dry-run)
-            </button>
-          </div>
+          <Card key={s.id}>
+            <CardContent className="flex flex-wrap items-center gap-2 p-3">
+              <Badge variant="success">{s.kind}</Badge>
+              <span className="font-mono text-xs text-info">{s.id.slice(0, 12)}</span>
+              <span className="text-xs text-muted-foreground">{fmtBytes(s.bytes)}</span>
+              <span className="text-xs text-muted-foreground">{s.createdAt}</span>
+              <Button
+                variant="outline"
+                size="sm"
+                className="ml-auto"
+                disabled={busy}
+                onClick={() => void restoreDryRun(s.id)}
+              >
+                restore (dry-run)
+              </Button>
+            </CardContent>
+          </Card>
         ))}
       </div>
-    </div>
+    </PanelBody>
   );
 }
