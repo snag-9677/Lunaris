@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@lunaris/core": "workspace:*",
+    "@lunaris/daemon": "workspace:*",
     "@lunaris/gateway": "workspace:*",
     "@lunaris/orchestrator": "workspace:*",
     "commander": "^14.0.0"
