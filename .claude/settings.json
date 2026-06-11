@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/sahirnagpal/.claude/skills/graphify/**)",
+      "Bash(python3 -)",
+      "Bash(mkdir -p *)",
+      "Bash(git add *)",
+      "Bash(git commit -q -m 'scaffold: Lunaris pnpm monorepo, shared contracts, spec *)"
+    ],
+    "additionalDirectories": [
+      "/tmp"
+    ]
+  }
+}

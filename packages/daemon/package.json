@@ -1,0 +1,31 @@
+{
+  "name": "@lunaris/daemon",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "lunarisd": "./dist/main.js"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test dist/**/*.test.js",
+    "dev": "node dist/main.js"
+  },
+  "dependencies": {
+    "@lunaris/core": "workspace:*",
+    "@lunaris/gateway": "workspace:*",
+    "@lunaris/orchestrator": "workspace:*",
+    "fastify": "^5.0.0",
+    "@fastify/websocket": "^11.0.0",
+    "@fastify/static": "^8.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0",
+    "@types/node": "^24.0.0"
+  }
+}

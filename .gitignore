@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.lunaris/state/
+.lunaris/journal/
+.lunaris/memory/
+*.local.toml
+.env
+.DS_Store
