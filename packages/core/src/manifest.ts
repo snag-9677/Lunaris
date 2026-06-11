@@ -113,7 +113,9 @@ baseUrl = "https://api.deepseek.com"
 keyEnv = "DEEPSEEK_API_KEY"
 
 [providers.ollama]
-baseUrl = "http://localhost:11434"
+# Local, no key. Base URL comes from OLLAMA_BASE_URL in .aienv
+# (default http://localhost:11434); uncomment to pin it here instead.
+# baseUrl = "http://localhost:11434"
 
 [budgets]
 perCallUsd = 0.5

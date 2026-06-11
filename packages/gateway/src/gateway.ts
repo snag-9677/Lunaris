@@ -169,8 +169,11 @@ export class ModelGateway {
           baseUrl: cfg.baseUrl ?? DEEPSEEK_DEFAULT_BASE_URL,
         });
       case 'ollama': {
+        // Base URL precedence: OLLAMA_BASE_URL env (set via .aienv, the
+        // per-machine override) > manifest cfg.baseUrl > adapter default.
         const opts: { baseUrl?: string } = {};
-        if (cfg.baseUrl) opts.baseUrl = cfg.baseUrl;
+        const baseUrl = this.env['OLLAMA_BASE_URL'] || cfg.baseUrl;
+        if (baseUrl) opts.baseUrl = baseUrl;
         return new OllamaAdapter(opts);
       }
       case 'mock':

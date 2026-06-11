@@ -285,3 +285,69 @@ test('pricing: estimateCostUsd applies per-MTok rates; local providers are free'
   assert.equal(estimateCostUsd('mock/echo', { inputTokens: 1_000_000, outputTokens: 1_000_000 }), 0);
   assert.equal(estimateCostUsd('openai/some-unknown-model', { inputTokens: 1_000_000, outputTokens: 0 }), 0);
 });
+
+test('ollama base URL resolution: OLLAMA_BASE_URL env overrides manifest, falls back to default', async () => {
+  // Stub global fetch to capture the URL the Ollama adapter hits and return a
+  // minimal NDJSON completion stream.
+  const realFetch = globalThis.fetch;
+  const calls: string[] = [];
+  globalThis.fetch = (async (url: string | URL) => {
+    calls.push(String(url));
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          new TextEncoder().encode(
+            JSON.stringify({ message: { content: 'hi' }, done: true, prompt_eval_count: 1, eval_count: 1 }) + '\n',
+          ),
+        );
+        controller.close();
+      },
+    });
+    return new Response(body, { status: 200, headers: { 'content-type': 'application/x-ndjson' } });
+  }) as typeof fetch;
+
+  try {
+    const req = (): UnifiedRequest => ({
+      model: 'ollama/llama3',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+      meta: { projectId: 'proj-1', callId: 'c', taskId: 't', agentRole: 'coder' },
+    });
+    const manifest: LunarisManifest = {
+      project: { id: 'proj-1', name: 'P' },
+      models: { default: 'ollama/llama3' },
+      providers: { ollama: { baseUrl: 'http://manifest-host:11434' } },
+      budgets: { perDayUsd: 10 },
+    };
+
+    // env wins over the manifest baseUrl
+    const gwEnv = new ModelGateway({
+      manifest,
+      ledger: new InMemoryBudgetLedger({ perDayUsd: 10 }),
+      env: { OLLAMA_BASE_URL: 'http://remote-ollama:9999' },
+    });
+    await collect(gwEnv.chat(req()));
+    assert.ok(calls[0]?.startsWith('http://remote-ollama:9999/'), `env override; got ${calls[0]}`);
+
+    // no env → manifest baseUrl
+    calls.length = 0;
+    const gwManifest = new ModelGateway({
+      manifest,
+      ledger: new InMemoryBudgetLedger({ perDayUsd: 10 }),
+      env: {},
+    });
+    await collect(gwManifest.chat(req()));
+    assert.ok(calls[0]?.startsWith('http://manifest-host:11434/'), `manifest fallback; got ${calls[0]}`);
+
+    // neither → adapter default localhost:11434
+    calls.length = 0;
+    const gwDefault = new ModelGateway({
+      manifest: { project: { id: 'p', name: 'P' }, models: { default: 'ollama/llama3' }, providers: { ollama: {} }, budgets: { perDayUsd: 10 } },
+      ledger: new InMemoryBudgetLedger({ perDayUsd: 10 }),
+      env: {},
+    });
+    await collect(gwDefault.chat(req()));
+    assert.ok(calls[0]?.startsWith('http://localhost:11434/'), `default; got ${calls[0]}`);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

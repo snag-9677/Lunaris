@@ -32,10 +32,13 @@ test('initManifest then loadManifest round-trips a valid manifest', () => {
   assert.deepEqual(loaded.budgets, { perCallUsd: 0.5, perDayUsd: 10 });
   assert.equal(loaded.providers?.['anthropic']?.keyEnv, 'ANTHROPIC_API_KEY');
   assert.equal(loaded.providers?.['deepseek']?.baseUrl, 'https://api.deepseek.com');
-  assert.equal(loaded.providers?.['ollama']?.baseUrl, 'http://localhost:11434');
+  // Ollama baseUrl is no longer hardcoded in the starter manifest — it comes
+  // from OLLAMA_BASE_URL in .aienv (default applied by the gateway adapter).
+  assert.equal(loaded.providers?.['ollama']?.baseUrl, undefined);
 
   assert.ok(existsSync(join(dir, '.lunaris', 'journal')), '.lunaris/journal created');
   assert.ok(existsSync(join(dir, '.lunaris', 'state')), '.lunaris/state created');
+  assert.ok(existsSync(join(dir, '.aienv.sample')), '.aienv.sample created');
 });
 
 test('initManifest refuses to overwrite an existing manifest', () => {

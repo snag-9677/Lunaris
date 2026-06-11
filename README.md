@@ -138,6 +138,7 @@ Resolve queued actions with `lunaris approvals` or the UI approval inbox.
 | `LUNARIS_WEBHOOK_SECRET` | HMAC secret for `/hooks/:project/:source` | — (loopback-only without it) |
 | `LUNARIS_WEBHOOK_SECRET_<PROJECTID>` | per-project webhook secret override | — |
 | `ANTHROPIC_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` | provider keys (names are whatever `keyEnv` says); set via `.aienv` or shell export | — |
+| `OLLAMA_BASE_URL` | Ollama endpoint; set in `.aienv`, overrides `lunaris.toml` | `http://localhost:11434` |
 
 ---
 

@@ -17,4 +17,6 @@ DEEPSEEK_API_KEY=
 # OpenAI / OpenAI-compatible endpoints
 OPENAI_API_KEY=
 
-# Ollama is local and needs no key (set baseUrl in lunaris.toml).
+# Ollama is local and needs no key. Point at a non-default host here
+# (default http://localhost:11434); this overrides lunaris.toml.
+OLLAMA_BASE_URL=http://localhost:11434
