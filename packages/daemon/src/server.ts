@@ -6,8 +6,8 @@
  * refused, and the host is hard-forced to 127.0.0.1 regardless.
  */
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Fastify from 'fastify';
@@ -22,13 +22,14 @@ import type {
   Goal,
   LunarisManifest,
   MemoryRecord,
+  Principal,
   PolicyRule,
   QueuedGoalStatus,
   ResolvedTool,
 } from '@lunaris/core';
 import { ProjectRegistry } from './registry.js';
-import { approvalsDbPath, defaultGoalRunner, memoryDbPath } from './goal-runner.js';
-import type { GoalRunner } from './goal-runner.js';
+import { acquireRunLease, approvalsDbPath, defaultGoalRunner, LeaseHeldError, memoryDbPath } from './goal-runner.js';
+import type { AcquiredLease, GoalRunner } from './goal-runner.js';
 import {
   banditDbPath,
   isSafePathSegment,
@@ -42,13 +43,59 @@ import {
   triggerDbPath,
   webhookSecretFor,
 } from './phase3.js';
+import {
+  bearerFromRequest,
+  capabilityForRoute,
+  defaultIdentityDbPath,
+  projectIdFromPath,
+  resolveAuthMode,
+  setupIdentity,
+} from './auth.js';
+import type { AuthContext, AuthMode, IdentityLike } from './auth.js';
+import {
+  buildVersionReport,
+  globalStorePaths,
+  leasesDbPath,
+  projectStorePaths,
+} from './phase4.js';
+import { loadLifecyclePkg } from './lifecycle-routes.js';
 
 const LOOPBACK_HOST = '127.0.0.1';
 const ALLOWED_HOSTS = new Set<string>([LOOPBACK_HOST, 'localhost', '::1']);
 
+/** Lifetime of a single-use WebSocket ticket (FIX 3). */
+const WS_TICKET_TTL_MS = 30_000;
+
+/**
+ * FIX 3: replace the value of any `ticket` query param in a URL with [REDACTED]
+ * for logging, preserving the rest of the URL (path + other params). Pure string
+ * op so it never throws on a malformed URL.
+ */
+export function redactTicketParam(url: string): string {
+  return url.replace(/([?&]ticket=)[^&#]*/gi, '$1[REDACTED]');
+}
+
+/**
+ * A short-lived, single-use WebSocket ticket (FIX 3). The long-lived bearer
+ * token must never appear in a URL (it lands in request logs), so the WS upgrade
+ * is authenticated with one of these instead: minted via POST /api/ws-ticket
+ * (which requires the bearer token in the Authorization header) and consumed
+ * exactly once by the /api/ws handler.
+ */
+interface WsTicket {
+  principalId: string;
+  sessionId?: string;
+  expiresAt: number;
+  used: boolean;
+}
+
 export interface LunarisServerContext {
   events: EventStore;
   registry: ProjectRegistry;
+  identity: IdentityLike;
+  /** Implicit loopback owner principal (used when auth is OFF). */
+  owner: Principal;
+  authMode: AuthMode;
 }
 
 declare module 'fastify' {
@@ -67,6 +114,18 @@ export interface BuildServerOptions {
   /** Goal execution strategy; defaults to ModelGateway + AgentLoop wiring. */
   runGoal?: GoalRunner;
   logger?: boolean;
+  /**
+   * Auth mode override; defaults to env LUNARIS_AUTH (off|on), default 'off' to
+   * preserve the Phase-1 zero-config loopback UX (implicit owner, all allowed).
+   */
+  authMode?: AuthMode;
+  /** Identity db path (default ~/.lunaris/identity.db). ':memory:' for tests. */
+  identityDbPath?: string;
+  /**
+   * Inject a pre-built identity store (tests). Takes precedence over
+   * identityDbPath; the implicit owner is taken from ensureLocalOwner().
+   */
+  identity?: IdentityLike;
 }
 
 function packageVersion(): string {
@@ -187,12 +246,89 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
 
   const runGoal = options.runGoal ?? defaultGoalRunner;
 
-  const app = Fastify({ logger: options.logger ?? false });
+  // ---- Identity / auth (Phase 4) ----
+  // Default: auth OFF on loopback with an implicit owner (Phase-1 UX). When ON,
+  // a bearer token is required on /api routes and dangerous routes are RBAC-gated.
+  const authMode: AuthMode = resolveAuthMode(options.authMode);
+  const identityDbPath = options.identityDbPath ?? defaultIdentityDbPath();
+  let identity: IdentityLike;
+  let owner: Principal;
+  if (options.identity !== undefined) {
+    identity = options.identity;
+    owner = identity.ensureLocalOwner('local');
+  } else {
+    if (identityDbPath !== ':memory:') mkdirSync(dirname(identityDbPath), { recursive: true });
+    const setup = setupIdentity(identityDbPath);
+    identity = setup.identity;
+    owner = setup.owner;
+  }
+
+  // ---- Lease + capability-token runtime (Phase 4) ----
+  // Shared across runs; goal submission acquires the per-repo lease (repoId =
+  // projectId), heartbeats for the run, and releases at the end. Constructed
+  // lazily so a daemon without write access to ~/.lunaris still boots; on any
+  // failure (e.g. unbuilt package) the daemon falls back to no-lease runs.
+  let leaseRuntime: import('./phase4.js').LeaseRuntime | undefined;
+  try {
+    const { makeLeaseRuntime } = await import('./phase4.js');
+    // When running against an in-memory identity db (tests), keep the lease
+    // store in memory and the signing key off the real ~/.lunaris dir.
+    if (options.identityDbPath === ':memory:') {
+      const ephemeralKey = join(
+        mkdtempSync(join(tmpdir(), 'lunarisd-agentkey-')),
+        'agent-key.pem',
+      );
+      leaseRuntime = makeLeaseRuntime({ leasesPath: ':memory:', keyPath: ephemeralKey });
+    } else {
+      leaseRuntime = makeLeaseRuntime();
+    }
+  } catch {
+    leaseRuntime = undefined;
+  }
+
+  // FIX 3: when the logger is on, install a custom request serializer that
+  // strips the `ticket` query param from the logged URL (and redacts the
+  // Authorization header) as defense-in-depth. The PRIMARY fix is that the WS
+  // handler no longer accepts the long-lived bearer token in the URL at all
+  // (see /api/ws-ticket + /api/ws below) — it accepts only a short single-use
+  // ticket — but we also keep that ticket out of request logs entirely.
+  const loggerOpt = options.logger
+    ? {
+        serializers: {
+          req(req: { method: string; url: string; headers?: Record<string, unknown> }): {
+            method: string;
+            url: string;
+            host: string | undefined;
+          } {
+            const host = req.headers?.['host'];
+            return {
+              method: req.method,
+              url: redactTicketParam(req.url),
+              host: typeof host === 'string' ? host : undefined,
+            };
+          },
+        },
+      }
+    : false;
+  const app = Fastify(loggerOpt === false ? { logger: false } : { logger: loggerOpt });
   enforceLoopbackOnly(app);
-  app.decorate('lunaris', { events, registry });
+  app.decorate('lunaris', { events, registry, identity, owner, authMode });
 
   app.addHook('onClose', async () => {
     (events as EventStore & { close?: () => void }).close?.();
+    // Only close an identity store we own (never one injected by a test).
+    if (options.identity === undefined) {
+      try {
+        identity.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    try {
+      leaseRuntime?.leaseStore.close();
+    } catch {
+      /* ignore */
+    }
   });
 
   await app.register(websocket);
@@ -232,7 +368,138 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
     app.addContentTypeParser(contentType, { parseAs: 'string' }, rawCapturingParser);
   }
 
+  // ---- WS ticket store (FIX 3) ----
+  // In-memory single-use tickets bound to the authenticated principal/session.
+  // Tickets expire after WS_TICKET_TTL_MS and are consumed exactly once. The
+  // long-lived bearer token is NEVER used as a WS ticket.
+  const wsTickets = new Map<string, WsTicket>();
+  const pruneWsTickets = (now: number): void => {
+    for (const [id, t] of wsTickets) {
+      if (t.used || now >= t.expiresAt) wsTickets.delete(id);
+    }
+  };
+  /** Validate + consume a single-use WS ticket. Returns the principalId or null. */
+  const consumeWsTicket = (ticket: string | undefined, now: number): string | null => {
+    if (typeof ticket !== 'string' || ticket.length === 0) return null;
+    const t = wsTickets.get(ticket);
+    if (t === undefined) return null;
+    // Always remove on lookup so a ticket can be presented at most once.
+    wsTickets.delete(ticket);
+    if (t.used || now >= t.expiresAt) return null;
+    return t.principalId;
+  };
+
+  // ---- Auth preHandler (Phase 4) ----
+  //
+  // When auth is OFF: attach the implicit owner to every request; all allowed.
+  // When auth is ON: /api/login is open; every other /api route requires a valid
+  // bearer token (401 otherwise). The resolved principal is then checked against
+  // the route's mapped Capability for the path's project (403 on denial).
+  app.addHook('preHandler', async (req, reply) => {
+    const path = req.url.split('?')[0] ?? req.url;
+    // Only guard /api/* (and not the login route itself); webhooks/static/WS
+    // have their own handling. WS auth is enforced inside the /api/ws handler.
+    if (!path.startsWith('/api/') || path === '/api/ws') return;
+
+    if (authMode === 'off') {
+      req.auth = { principal: owner, implicit: true } satisfies AuthContext;
+      return;
+    }
+
+    // Login is always reachable; it issues the token.
+    if (path === '/api/login') return;
+
+    const token = bearerFromRequest(
+      req.headers as Record<string, string | string[] | undefined>,
+      req.query,
+    );
+    if (token === undefined) {
+      return reply.code(401).send({ error: 'authentication required' });
+    }
+    const resolved = identity.resolveToken(token);
+    if (resolved === null) {
+      return reply.code(401).send({ error: 'invalid or expired token' });
+    }
+    req.auth = { principal: resolved.principal, session: resolved.session, implicit: false } satisfies AuthContext;
+
+    // Capability gate. null => no capability required (whoami/version).
+    const cap = capabilityForRoute(req.method, path);
+    if (cap === null || cap === undefined) return;
+    const projectId = projectIdFromPath(path) ?? 'global';
+    if (!identity.can(resolved.principal.id, projectId, cap)) {
+      return reply.code(403).send({ error: `missing capability: ${cap}` });
+    }
+  });
+
   // ---- API routes ----
+
+  // ---- Auth: login / whoami (Phase 4) ----
+
+  app.post<{ Body: { user?: unknown; password?: unknown } }>('/api/login', async (req, reply) => {
+    const body = (req.body ?? {}) as { user?: unknown; password?: unknown };
+    if (typeof body.user !== 'string' || body.user.length === 0 || typeof body.password !== 'string') {
+      return reply.code(400).send({ error: 'body must be {"user": "...", "password": "..."}' });
+    }
+    const result = identity.authenticate(body.user, body.password);
+    if (!result.ok || result.token === undefined || result.principal === undefined) {
+      // Do not leak which factor failed.
+      return reply.code(401).send({ error: 'invalid credentials' });
+    }
+    return reply.code(200).send({
+      token: result.token,
+      principal: result.principal,
+      expiresAt: result.session?.expiresAt,
+    });
+  });
+
+  app.get('/api/whoami', async (req) => {
+    const principal = req.auth?.principal ?? owner;
+    const role = identity.roleFor(principal.id, 'global');
+    return {
+      authMode,
+      principal,
+      role,
+      implicit: req.auth?.implicit ?? true,
+    };
+  });
+
+  // ---- WS ticket: POST /api/ws-ticket (FIX 3) ----
+  //
+  // Mint a short-lived (30s) single-use ticket bound to the authenticated
+  // principal/session for the WebSocket upgrade. This exists so the long-lived
+  // bearer token never has to travel in the ?ticket= query string (where it
+  // would be written to request logs). Reaching this route already required a
+  // valid bearer token in the Authorization header (the auth preHandler), so we
+  // simply bind the ticket to req.auth's principal.
+  app.post('/api/ws-ticket', async (req, reply) => {
+    const principal = req.auth?.principal ?? owner;
+    const now = Date.now();
+    pruneWsTickets(now);
+    const ticket = randomUUID();
+    wsTickets.set(ticket, {
+      principalId: principal.id,
+      ...(req.auth?.session !== undefined ? { sessionId: req.auth.session.id } : {}),
+      expiresAt: now + WS_TICKET_TTL_MS,
+      used: false,
+    });
+    return reply.code(201).send({ ticket, expiresInMs: WS_TICKET_TTL_MS });
+  });
+
+  // ---- Version + schema doctor (Phase 4) ----
+
+  app.get('/api/version', async () => {
+    const eventsPath = options.eventsDbPath ?? join(homedir(), '.lunaris', 'events.db');
+    const globals = globalStorePaths(eventsPath, identityDbPath, leasesDbPath());
+    const perProject: Record<string, string> = {};
+    for (const project of registry.list()) {
+      for (const [store, path] of Object.entries(projectStorePaths(project.root))) {
+        // Namespace project stores so multiple projects don't collide in the map.
+        perProject[`${project.id}:${store}`] = path;
+      }
+    }
+    const { version, doctor: report } = buildVersionReport({ ...globals, ...perProject });
+    return { version, doctor: report };
+  });
 
   app.get('/api/status', async () => ({
     name: 'lunarisd',
@@ -284,6 +551,24 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
         createdAt: new Date().toISOString(),
         status: 'running',
       };
+
+      // Lease + fencing (Phase 4): atomically acquire the repo lease (repoId =
+      // projectId) BEFORE dispatching. If a live lease is held by another run,
+      // reject with 409 (one orchestrator per repo) instead of double-running.
+      // The acquired lease (epoch + scoped agent token + isFenced) is threaded
+      // into the run and released when it finishes.
+      let acquiredLease: AcquiredLease | undefined;
+      if (leaseRuntime !== undefined) {
+        try {
+          acquiredLease = acquireRunLease(goal, leaseRuntime);
+        } catch (err) {
+          if (err instanceof LeaseHeldError) {
+            return reply.code(409).send({ error: err.message, holder: err.holder });
+          }
+          throw err;
+        }
+      }
+
       events.append({ projectId: project.id, kind: 'goal.created', payload: goal });
 
       // Run asynchronously: respond immediately; terminal state lands as an
@@ -299,6 +584,8 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
             events,
             projectRoot: project.root,
             ...(pluginTools.length > 0 ? { pluginTools } : {}),
+            ...(leaseRuntime !== undefined ? { lease: leaseRuntime } : {}),
+            ...(acquiredLease !== undefined ? { acquiredLease } : {}),
           });
         })
         .then(
@@ -325,7 +612,12 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
               app.log.error({ err }, 'goal failed and event append also failed');
             }
           },
-        );
+        )
+        .finally(() => {
+          // Release the lease once the run is fully done (the runner also stops
+          // it via withLease/ownLease; release is idempotent in the store).
+          acquiredLease?.stop();
+        });
 
       return reply.code(202).send({ goalId: goal.goalId });
     },
@@ -914,9 +1206,117 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
     },
   );
 
+  // ---- Lifecycle: snapshot / restore / export (Phase 4) ----
+
+  app.post<{ Params: { id: string }; Body: { kind?: unknown } }>(
+    '/api/projects/:id/snapshot',
+    async (req, reply) => {
+      const project = registry.get(req.params.id);
+      if (!project) {
+        return reply.code(404).send({ error: `unknown project: ${req.params.id}` });
+      }
+      const pkg = await loadLifecyclePkg();
+      if (!pkg) return reply.code(503).send({ error: '@lunaris/lifecycle unavailable' });
+      const body = (req.body ?? {}) as { kind?: unknown };
+      const kind = body.kind === 'pre-op' ? 'pre-op' : 'full';
+      try {
+        return await reply.code(201).send(pkg.snapshot(project.root, { kind }));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return reply.code(500).send({ error: `snapshot failed: ${message}` });
+      }
+    },
+  );
+
+  app.get<{ Params: { id: string } }>('/api/projects/:id/snapshots', async (req, reply) => {
+    const project = registry.get(req.params.id);
+    if (!project) {
+      return reply.code(404).send({ error: `unknown project: ${req.params.id}` });
+    }
+    const pkg = await loadLifecyclePkg();
+    if (!pkg) return { snapshots: [] };
+    try {
+      return { snapshots: pkg.listSnapshots(project.root) };
+    } catch {
+      return { snapshots: [] };
+    }
+  });
+
+  app.post<{ Params: { id: string }; Body: { snapshotId?: unknown; dryRun?: unknown; force?: unknown } }>(
+    '/api/projects/:id/restore',
+    async (req, reply) => {
+      const project = registry.get(req.params.id);
+      if (!project) {
+        return reply.code(404).send({ error: `unknown project: ${req.params.id}` });
+      }
+      const body = (req.body ?? {}) as { snapshotId?: unknown; dryRun?: unknown; force?: unknown };
+      if (typeof body.snapshotId !== 'string' || body.snapshotId.length === 0) {
+        return reply.code(400).send({ error: 'body must be {"snapshotId": "...", "dryRun"?: boolean, "force"?: boolean}' });
+      }
+      const pkg = await loadLifecyclePkg();
+      if (!pkg) return reply.code(503).send({ error: '@lunaris/lifecycle unavailable' });
+      const dryRun = body.dryRun === true;
+      // FIX 7: `force` is required to write back secrets/instance.json; off by
+      // default so a restore never re-introduces secret material.
+      const force = body.force === true;
+      try {
+        return pkg.restore(project.root, body.snapshotId, { dryRun, force });
+      } catch (err) {
+        // FIX 7: a cross-project restore is a client error (409), not a 404.
+        if (err instanceof Error && (err as { code?: string }).code === 'PROJECT_MISMATCH') {
+          return reply.code(409).send({ error: err.message });
+        }
+        const message = err instanceof Error ? err.message : String(err);
+        return reply.code(404).send({ error: `restore failed: ${message}` });
+      }
+    },
+  );
+
+  app.post<{ Params: { id: string }; Body: { outPath?: unknown; name?: unknown } }>(
+    '/api/projects/:id/export',
+    async (req, reply) => {
+      const project = registry.get(req.params.id);
+      if (!project) {
+        return reply.code(404).send({ error: `unknown project: ${req.params.id}` });
+      }
+      const pkg = await loadLifecyclePkg();
+      if (!pkg) return reply.code(503).send({ error: '@lunaris/lifecycle unavailable' });
+      const body = (req.body ?? {}) as { outPath?: unknown; name?: unknown };
+      const outPath =
+        typeof body.outPath === 'string' && body.outPath.length > 0
+          ? body.outPath
+          : join(project.root, '.lunaris', `${project.id}.bundle.tar.gz`);
+      const name = typeof body.name === 'string' && body.name.length > 0 ? body.name : project.name;
+      try {
+        const manifest = pkg.exportBundle(project.root, outPath, { name });
+        return await reply.code(201).send({ outPath, manifest });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return reply.code(500).send({ error: `export failed: ${message}` });
+      }
+    },
+  );
+
   // ---- WS: live event stream ----
 
-  app.get('/api/ws', { websocket: true }, (socket) => {
+  app.get('/api/ws', { websocket: true }, (socket, req) => {
+    // WS auth (FIX 3): when auth is ON, require a short-lived SINGLE-USE ticket
+    // (minted via POST /api/ws-ticket) on the upgrade — NOT the long-lived bearer
+    // token, which must never appear in a URL/log. The bearer token is therefore
+    // explicitly rejected here: it is not a valid ws-ticket.
+    if (authMode === 'on') {
+      const query = req.query as Record<string, unknown> | undefined;
+      const ticket = query !== undefined && typeof query['ticket'] === 'string' ? query['ticket'] : undefined;
+      const principalId = consumeWsTicket(ticket, Date.now());
+      if (principalId === null) {
+        try {
+          socket.close(1008, 'unauthorized');
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+    }
     let active = true;
     const unsubscribe = events.subscribe((e) => {
       if (socket.readyState === socket.OPEN) {

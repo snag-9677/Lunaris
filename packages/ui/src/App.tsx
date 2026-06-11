@@ -6,9 +6,11 @@ import {
   MemoryPanel,
   OptimizePanel,
   PluginsPanel,
+  SystemPanel,
 } from './components/panels.js';
+import { authFetch, getAuthToken, login, setAuthToken, whoami, wsUrlWithTicket } from './api.js';
 
-type RightTab = 'feed' | 'analytics' | 'memory' | 'approvals' | 'optimize' | 'plugins' | 'automation';
+type RightTab = 'feed' | 'analytics' | 'memory' | 'approvals' | 'optimize' | 'plugins' | 'automation' | 'system';
 
 /* ---------- types (mirror of @lunaris/core EventEnvelope; UI stays dep-free) ---------- */
 
@@ -216,9 +218,58 @@ export function App() {
   const [rightTab, setRightTab] = useState<RightTab>('feed');
   const transcriptRef = useRef<HTMLDivElement | null>(null);
 
+  // ---- Auth (Phase 4) ----
+  // authMode is detected from /api/whoami. When 'on' and we have no token, a
+  // login form gates the app. The token lives in memory (../api) and is sent on
+  // every fetch + the WS ticket. When 'off', no login is shown (current UX).
+  const [authMode, setAuthMode] = useState<'off' | 'on' | 'unknown'>('unknown');
+  const [authed, setAuthed] = useState(false);
+  const [principalName, setPrincipalName] = useState<string | undefined>();
+  const [principalRole, setPrincipalRole] = useState<string | null>(null);
+  const [loginUser, setLoginUser] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [loginError, setLoginError] = useState<string | undefined>();
+
+  const refreshWhoami = useCallback(async () => {
+    try {
+      const who = await whoami();
+      setAuthMode(who.authMode);
+      setPrincipalName(who.principal.displayName);
+      setPrincipalRole(who.role);
+      // Authed iff auth is off (implicit owner) or we hold a working token.
+      setAuthed(who.authMode === 'off' || getAuthToken() !== undefined);
+    } catch {
+      // A 401 means auth is ON and we are not logged in yet.
+      setAuthMode('on');
+      setAuthed(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshWhoami();
+  }, [refreshWhoami]);
+
+  const doLogin = useCallback(async () => {
+    setLoginError(undefined);
+    try {
+      const res = await login(loginUser.trim(), loginPassword);
+      setAuthToken(res.token);
+      setLoginPassword('');
+      await refreshWhoami();
+    } catch (err) {
+      setLoginError(err instanceof Error ? err.message : String(err));
+    }
+  }, [loginUser, loginPassword, refreshWhoami]);
+
+  const doLogout = useCallback(() => {
+    setAuthToken(undefined);
+    setAuthed(false);
+    void refreshWhoami();
+  }, [refreshWhoami]);
+
   const loadProjects = useCallback(async () => {
     try {
-      const res = await fetch('/api/projects');
+      const res = await authFetch('/api/projects');
       if (!res.ok) throw new Error(`GET /api/projects → ${res.status}`);
       const list = normalizeProjects(await res.json());
       setProjects(list);
@@ -230,19 +281,33 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    void loadProjects();
-  }, [loadProjects]);
+    if (authed) void loadProjects();
+  }, [loadProjects, authed]);
 
   useEffect(() => {
+    if (!authed) return;
     let disposed = false;
     let ws: WebSocket | null = null;
     let retry: number | undefined;
 
-    const connect = () => {
+    const connect = async () => {
       if (disposed) return;
       setWsStatus('connecting');
       const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-      ws = new WebSocket(`${proto}://${window.location.host}/api/ws`);
+      // Mint a short-lived single-use ws-ticket (FIX 3) and attach it as the
+      // ?ticket= param so the upgrade authenticates when auth is ON (WebSocket
+      // can't set an Authorization header). The long-lived bearer token is never
+      // placed in the URL.
+      let url: string;
+      try {
+        url = await wsUrlWithTicket(`${proto}://${window.location.host}/api/ws`);
+      } catch {
+        setWsStatus('closed');
+        if (!disposed) retry = window.setTimeout(() => void connect(), 2000);
+        return;
+      }
+      if (disposed) return;
+      ws = new WebSocket(url);
       ws.onopen = () => setWsStatus('open');
       ws.onmessage = (msg: MessageEvent) => {
         if (typeof msg.data !== 'string') return;
@@ -259,18 +324,18 @@ export function App() {
       };
       ws.onclose = () => {
         setWsStatus('closed');
-        if (!disposed) retry = window.setTimeout(connect, 2000);
+        if (!disposed) retry = window.setTimeout(() => void connect(), 2000);
       };
       ws.onerror = () => ws?.close();
     };
 
-    connect();
+    void connect();
     return () => {
       disposed = true;
       if (retry !== undefined) window.clearTimeout(retry);
       ws?.close();
     };
-  }, []);
+  }, [authed]);
 
   const transcript = chats[selectedId] ?? [];
 
@@ -292,7 +357,7 @@ export function App() {
       };
     });
     try {
-      const res = await fetch(`/api/projects/${encodeURIComponent(selectedId)}/goals`, {
+      const res = await authFetch(`/api/projects/${encodeURIComponent(selectedId)}/goals`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ prompt }),
@@ -312,12 +377,63 @@ export function App() {
     }
   }, [input, selectedId]);
 
+  // Login gate: only shown when auth is ON and we are not authenticated.
+  if (authMode === 'on' && !authed) {
+    return (
+      <div className="app">
+        <header className="header">
+          <h1>Lunaris · Mission Control</h1>
+        </header>
+        <div className="login-gate">
+          <form
+            className="login-form"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void doLogin();
+            }}
+          >
+            <h2>sign in</h2>
+            <input
+              type="text"
+              value={loginUser}
+              placeholder="user"
+              autoComplete="username"
+              onChange={(e) => setLoginUser(e.target.value)}
+            />
+            <input
+              type="password"
+              value={loginPassword}
+              placeholder="password"
+              autoComplete="current-password"
+              onChange={(e) => setLoginPassword(e.target.value)}
+            />
+            {loginError && <div className="error">{loginError}</div>}
+            <button type="submit" disabled={loginUser.trim().length === 0}>
+              sign in
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="app">
       <header className="header">
         <h1>Lunaris · Mission Control</h1>
         <span className={`ws-dot ws-${wsStatus}`} title={`websocket: ${wsStatus}`} />
         <span className="ws-label">{wsStatus}</span>
+        {principalName && (
+          <span className="who" title={principalRole ? `role: ${principalRole}` : undefined}>
+            {principalName}
+            {principalRole ? ` · ${principalRole}` : ''}
+          </span>
+        )}
+        {authMode === 'on' && authed && (
+          <button type="button" className="logout" onClick={doLogout}>
+            sign out
+          </button>
+        )}
       </header>
 
       <main className="main">
@@ -378,7 +494,7 @@ export function App() {
         <section className="right">
           <div className="tabs">
             {(
-              ['feed', 'analytics', 'memory', 'approvals', 'optimize', 'plugins', 'automation'] as RightTab[]
+              ['feed', 'analytics', 'memory', 'approvals', 'optimize', 'plugins', 'automation', 'system'] as RightTab[]
             ).map((tab) => (
               <button
                 key={tab}
@@ -404,6 +520,7 @@ export function App() {
           {rightTab === 'optimize' && <OptimizePanel projectId={selectedId} />}
           {rightTab === 'plugins' && <PluginsPanel projectId={selectedId} />}
           {rightTab === 'automation' && <AutomationPanel projectId={selectedId} />}
+          {rightTab === 'system' && <SystemPanel projectId={selectedId} />}
         </section>
       </main>
     </div>

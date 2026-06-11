@@ -328,6 +328,118 @@ export function formatQueuedGoalLine(g: QueuedGoalLike): string {
   return `${id}  ${status}  p${g.priority}  ${g.attempts}/${g.maxAttempts}  ${g.source.padEnd(14)}  ${truncate(g.prompt, 50)}`;
 }
 
+/* ---------- Phase 4: auth / lifecycle / lease / version renderers ---------- */
+
+/** Minimal Principal view for CLI rendering. */
+export interface PrincipalLike {
+  id: string;
+  kind: string;
+  displayName: string;
+  status?: string;
+}
+
+/** Render `lun whoami` output lines. */
+export function formatWhoami(principal: PrincipalLike, role: string | null): string[] {
+  return [
+    `principal: ${principal.displayName} (${principal.id})`,
+    `kind:      ${principal.kind}`,
+    `role:      ${role ?? '(unbound)'}`,
+    `status:    ${principal.status ?? 'active'}`,
+  ];
+}
+
+/** Minimal SnapshotInfo view for CLI rendering. */
+export interface SnapshotInfoLike {
+  id: string;
+  createdAt: string;
+  bytes: number;
+  kind: string;
+}
+
+/** Human-readable byte size. */
+export function formatBytes(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}MB`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}kB`;
+  return `${n}B`;
+}
+
+/** One-line rendering of a snapshot. */
+export function formatSnapshotLine(s: SnapshotInfoLike): string {
+  const id = s.id.slice(0, 12);
+  return `${id}  ${s.kind.padEnd(6)}  ${formatBytes(s.bytes).padStart(8)}  ${s.createdAt}`;
+}
+
+/** Minimal BundleManifest view for CLI rendering. */
+export interface BundleManifestLike {
+  formatVersion: number;
+  projectId: string;
+  name: string;
+  createdAt: string;
+  contents: string[];
+  schemaVersions: Record<string, number>;
+}
+
+/** Render bundle-manifest summary lines. */
+export function formatBundleManifest(m: BundleManifestLike): string[] {
+  const lines: string[] = [];
+  lines.push(`  name:     ${m.name}`);
+  lines.push(`  project:  ${m.projectId}`);
+  lines.push(`  format:   v${m.formatVersion}`);
+  lines.push(`  contents: ${m.contents.length > 0 ? m.contents.join(', ') : '(none)'}`);
+  return lines;
+}
+
+/** Minimal Lease view for CLI rendering. */
+export interface LeaseLike {
+  repoId: string;
+  holderId: string;
+  nodeId: string;
+  epoch: number;
+  acquiredAt: string;
+  heartbeatAt: string;
+}
+
+/** One-line rendering of the current lease. */
+export function formatLeaseLine(l: LeaseLike): string {
+  return `lease ${l.repoId}: holder ${l.holderId.slice(0, 12)} node ${l.nodeId} epoch ${l.epoch} (heartbeat ${l.heartbeatAt})`;
+}
+
+/** Minimal VersionInfo + DoctorReport views for CLI rendering. */
+export interface VersionInfoLike {
+  harness: string;
+  schemaVersions: Record<string, number>;
+}
+export interface StoreReportLike {
+  store: string;
+  present: boolean;
+  version: number | null;
+  expected: number | null;
+  status: string;
+}
+export interface DoctorReportLike {
+  harness: string;
+  stores: StoreReportLike[];
+}
+
+/** Render `lun version`: harness version + a per-store schema doctor table. */
+export function formatDoctorReport(version: VersionInfoLike, report: DoctorReportLike): string[] {
+  const lines: string[] = [];
+  lines.push(`lunaris harness ${version.harness}`);
+  lines.push('');
+  lines.push('schema doctor:');
+  if (report.stores.length === 0) {
+    lines.push('  (no stores found)');
+    return lines;
+  }
+  const nameW = Math.max(5, ...report.stores.map((s) => s.store.length));
+  for (const s of report.stores) {
+    const ver = s.version === null ? '-' : String(s.version);
+    const exp = s.expected === null ? '-' : String(s.expected);
+    lines.push(`  ${s.store.padEnd(nameW)}  v${ver}/${exp}  ${s.status}`);
+  }
+  return lines;
+}
+
 /** Normalize initManifest()'s return value into a list of created file paths. */
 export function createdFilesFrom(result: unknown): string[] {
   if (typeof result === 'string') return [result];

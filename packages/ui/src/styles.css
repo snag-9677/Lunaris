@@ -894,3 +894,155 @@ body {
   color: var(--red);
   border-color: #5a2a35;
 }
+
+/* ---------- Phase 4: auth (login gate + header who/logout) ---------- */
+
+.who {
+  color: var(--fg-dim);
+  font-size: 11px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-raised);
+}
+
+.logout {
+  font-size: 11px;
+  padding: 3px 10px;
+  background: var(--bg-raised);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.logout:hover {
+  border-color: var(--accent);
+}
+
+.login-gate {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  padding: 40px;
+}
+
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 280px;
+  padding: 28px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.login-form h2 {
+  margin: 0 0 4px;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+}
+
+.login-form input {
+  background: var(--bg-raised);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-size: 13px;
+}
+
+.login-form input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.login-form button {
+  background: var(--accent);
+  color: var(--bg);
+  border: none;
+  border-radius: 4px;
+  padding: 8px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.login-form button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ---------- Phase 4: System panel ---------- */
+
+.sys-note {
+  color: var(--green);
+  font-size: 11px;
+  padding: 6px 12px;
+}
+
+.sys-lease {
+  font-size: 12px;
+  color: var(--fg);
+  padding: 4px 0;
+  font-family: ui-monospace, monospace;
+}
+
+.sys-actions {
+  display: flex;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.sys-snap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.sys-snap-id {
+  font-family: ui-monospace, monospace;
+  color: var(--cyan);
+}
+
+.sys-restore {
+  margin-left: auto;
+  font-size: 11px;
+  padding: 3px 8px;
+  background: var(--bg-raised);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.sys-restore:hover {
+  border-color: var(--accent);
+}
+
+/* schema doctor status badges */
+.badge.doctor-ok {
+  background: #1e3326;
+  color: var(--green);
+}
+
+.badge.doctor-behind {
+  background: #3a2e1a;
+  color: var(--amber);
+}
+
+.badge.doctor-ahead {
+  background: #2a2440;
+  color: var(--purple);
+}
+
+.badge.doctor-missing {
+  background: #3a1f26;
+  color: var(--red);
+}

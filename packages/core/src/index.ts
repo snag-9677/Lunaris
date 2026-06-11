@@ -3,3 +3,6 @@ export * from './ids.js';
 export * from './manifest.js';
 export * from './events.js';
 export * from './analytics.js';
+export * from './version.js';
+export * from './migrate.js';
+export * from './doctor.js';

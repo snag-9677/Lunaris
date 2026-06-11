@@ -1047,3 +1047,383 @@ test('a throwing pluginHost is tolerated: run proceeds with built-ins only', asy
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// ----- Phase 4: lease fencing + subagent capability-token attenuation -----
+
+test('lease fencing: a side-effecting tool aborts the run as blocked when isFenced is false', async () => {
+  const root = await makeRoot();
+  try {
+    const { store, events } = stubEvents();
+    // The model wants to write a file (side-effecting); the fence is down.
+    const gw = scriptedGateway((_req, call) => {
+      if (call === 1) {
+        return [
+          {
+            type: 'tool_call',
+            id: 't1',
+            name: 'write_file',
+            args: { path: 'out.txt', content: 'data' },
+          },
+          end('tool_calls'),
+        ];
+      }
+      return [{ type: 'text_delta', text: 'should never reach here' }, end('end')];
+    });
+    const loop = new AgentLoop({
+      gateway: gw,
+      events: store,
+      projectId: 'p1',
+      projectRoot: root,
+      model: 'mock/echo',
+      leaseEpoch: 7,
+      // Lease lost: a newer holder owns the repo.
+      isFenced: () => false,
+    });
+    const outcome = await loop.run(makeGoal('write a file'), 'coder');
+
+    // Run is BLOCKED (not infra) and the side effect never happened.
+    assert.equal(outcome.result.status, 'blocked');
+    assert.equal(outcome.result.failureClass, undefined);
+    assert.match(outcome.result.summary, /lease lost/);
+    await assert.rejects(readFile(path.join(root, 'out.txt'), 'utf8'));
+
+    // The gateway was only called once (we aborted before a second turn).
+    assert.equal(gw.requests.length, 1);
+
+    // A lease.fenced event was emitted carrying the held epoch.
+    const fenced = events.filter((e) => e.kind === 'lease.fenced');
+    assert.equal(fenced.length, 1);
+    const fp = fenced[0]!.payload as { name: string; leaseEpoch: number };
+    assert.equal(fp.name, 'write_file');
+    assert.equal(fp.leaseEpoch, 7);
+
+    // No tool.call event for the blocked write.
+    assert.equal(events.filter((e) => e.kind === 'tool.call').length, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('lease fencing: read-only tools are NOT fenced and side-effecting tool.call events carry the epoch', async () => {
+  const root = await makeRoot();
+  try {
+    const { store, events } = stubEvents();
+    let fenceChecks = 0;
+    const gw = scriptedGateway((_req, call) => {
+      if (call === 1) {
+        // read_file is read-only — must run even while fenced down...
+        return [
+          { type: 'tool_call', id: 'r1', name: 'list_dir', args: { path: '.' } },
+          end('tool_calls'),
+        ];
+      }
+      if (call === 2) {
+        // ...then a side-effecting write while the fence is UP — must run + stamp.
+        return [
+          {
+            type: 'tool_call',
+            id: 'w1',
+            name: 'write_file',
+            args: { path: 'ok.txt', content: 'x' },
+          },
+          end('tool_calls'),
+        ];
+      }
+      return [{ type: 'text_delta', text: 'done' }, end('end')];
+    });
+    const loop = new AgentLoop({
+      gateway: gw,
+      events: store,
+      projectId: 'p1',
+      projectRoot: root,
+      model: 'mock/echo',
+      leaseEpoch: 3,
+      isFenced: (epoch) => {
+        fenceChecks++;
+        assert.equal(epoch, 3);
+        return true; // lease held
+      },
+    });
+    const outcome = await loop.run(makeGoal('list then write'), 'coder');
+    assert.equal(outcome.result.status, 'success');
+    assert.equal(await readFile(path.join(root, 'ok.txt'), 'utf8'), 'x');
+
+    // isFenced was consulted ONLY for the side-effecting write, never for list_dir.
+    assert.equal(fenceChecks, 1);
+
+    const toolEvents = events.filter((e) => e.kind === 'tool.call');
+    const list = toolEvents.find((e) => (e.payload as { name: string }).name === 'list_dir');
+    const write = toolEvents.find((e) => (e.payload as { name: string }).name === 'write_file');
+    assert.ok(list && write);
+    // read-only event is NOT stamped; the side-effecting write IS stamped.
+    assert.equal((list.payload as { leaseEpoch?: number }).leaseEpoch, undefined);
+    assert.equal((write.payload as { leaseEpoch?: number }).leaseEpoch, 3);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('subagent attenuation: child token is a strict subset of the parent (drops spawn, narrows fs)', async () => {
+  const root = await makeRoot();
+  try {
+    const { store } = stubEvents();
+    const { Ed25519CapabilityTokenService } = await import('@lunaris/identity');
+    // Real signing service backed by a freshly generated key persisted under root.
+    const svc = new Ed25519CapabilityTokenService({ keyPath: path.join(root, 'cap.pem') });
+
+    const parentCaps = ['fs.write', 'exec', 'net', 'spawn', 'provider:ollama'];
+    const parentToken = svc.mint({
+      principalId: 'agt_parent',
+      projectId: 'p1',
+      runId: 'run1',
+      leaseEpoch: 5,
+      caps: parentCaps,
+    });
+
+    // The orchestrator spawns a 'coder' subagent; coder's role has run_bash +
+    // write_file, so exec + fs.write survive, but spawn is always dropped.
+    let childTokenSeen: string | undefined;
+    const gw = scriptedGateway((req, call) => {
+      if (req.meta.agentRole === 'coder') {
+        // Capture the child's view by having it report nothing side-effecting.
+        return [{ type: 'text_delta', text: 'sub done' }, end('end')];
+      }
+      if (call === 1) {
+        return [
+          {
+            type: 'tool_call',
+            id: 's1',
+            name: 'spawn_subagent',
+            args: { role: 'coder', task: 'do a thing' },
+          },
+          end('tool_calls'),
+        ];
+      }
+      return [{ type: 'text_delta', text: 'orchestration complete' }, end('end')];
+    });
+
+    // Wrap the service so we can observe the exact child token attenuate() emits.
+    const observingCapTokens = {
+      attenuate(signed: string, caps: string[]): string {
+        const child = svc.attenuate(signed, caps);
+        childTokenSeen = child;
+        return child;
+      },
+    };
+
+    const loop = new AgentLoop({
+      gateway: gw,
+      events: store,
+      projectId: 'p1',
+      projectRoot: root,
+      model: 'mock/echo',
+      leaseEpoch: 5,
+      capToken: parentToken,
+      capTokens: observingCapTokens,
+    });
+    const outcome = await loop.run(makeGoal('delegate'), 'orchestrator');
+    assert.equal(outcome.result.status, 'success');
+
+    // A child token was minted via attenuation.
+    assert.ok(childTokenSeen, 'expected an attenuated child token');
+    const childDecoded = svc.verify(childTokenSeen!);
+    assert.ok(childDecoded, 'child token must verify against the signing key');
+
+    const childCaps = new Set(childDecoded!.caps);
+    // STRICT SUBSET: every child cap is in the parent...
+    for (const cap of childDecoded!.caps) assert.ok(parentCaps.includes(cap), `escalated: ${cap}`);
+    // ...and it is strictly smaller (spawn was dropped).
+    assert.ok(!childCaps.has('spawn'), 'child must not retain spawn');
+    assert.ok(childCaps.size < parentCaps.length, 'child must be a strict subset');
+    // coder keeps exec + fs.write (it has run_bash + write_file).
+    assert.ok(childCaps.has('exec'));
+    assert.ok(childCaps.has('fs.write'));
+    // Inherited, non-escalating run binding.
+    assert.equal(childDecoded!.projectId, 'p1');
+    assert.equal(childDecoded!.runId, 'run1');
+    assert.equal(childDecoded!.leaseEpoch, 5);
+    assert.equal(childDecoded!.principalId, 'agt_parent');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('FIX 1+2 end-to-end: role-style run caps attenuate per child; coder keeps exec+fs.write, researcher loses both, all lose spawn; escalation throws', async () => {
+  const root = await makeRoot();
+  try {
+    const { store } = stubEvents();
+    const { Ed25519CapabilityTokenService } = await import('@lunaris/identity');
+    const svc = new Ed25519CapabilityTokenService({ keyPath: path.join(root, 'cap.pem') });
+
+    // The TOP-LEVEL run set the daemon now mints (see goal-runner
+    // TOP_LEVEL_RUN_CAPS): role-style caps, NOT rbac:* — the exact vocabulary
+    // subagentCaps() narrows. `spawn` is held by the top-level run only.
+    const TOP_LEVEL_CAPS = ['spawn', 'exec', 'fs.read', 'fs.write', 'net.fetch'];
+    const parentToken = svc.mint({
+      principalId: 'agt_parent',
+      projectId: 'p1',
+      runId: 'run1',
+      leaseEpoch: 7,
+      caps: TOP_LEVEL_CAPS,
+    });
+
+    // A role registry with a coder (run_bash + write_file) and a researcher
+    // (read-only: no run_bash, no write tool). The orchestrator may spawn both.
+    const roles: Record<string, RoleDef> = {
+      orchestrator: {
+        name: 'orchestrator',
+        systemPrompt: 'orchestrate',
+        tools: ['read_file', 'write_file', 'run_bash', 'spawn_subagent'],
+        maxIterations: 8,
+      },
+      coder: {
+        name: 'coder',
+        systemPrompt: 'code',
+        tools: ['read_file', 'write_file', 'run_bash'],
+        maxIterations: 4,
+      },
+      researcher: {
+        name: 'researcher',
+        systemPrompt: 'research',
+        tools: ['read_file', 'list_dir', 'web_fetch'],
+        maxIterations: 4,
+      },
+    };
+
+    // Capture every child token attenuate() emits, keyed by the requested caps.
+    const childTokens: string[] = [];
+    const observingCapTokens = {
+      attenuate(signed: string, caps: string[]): string {
+        const child = svc.attenuate(signed, caps);
+        childTokens.push(child);
+        return child;
+      },
+    };
+
+    // Orchestrator spawns a coder, then (next orchestrator turn) a researcher,
+    // each subagent reports a trivial final message. The gateway's `call` arg is
+    // the GLOBAL request count (subagent turns increment it too), so we drive the
+    // orchestrator's progression with explicit flags on the agentRole instead.
+    let spawnedCoder = false;
+    let spawnedResearcher = false;
+    const gw = scriptedGateway((req) => {
+      if (req.meta.agentRole === 'coder' || req.meta.agentRole === 'researcher') {
+        return [{ type: 'text_delta', text: 'sub done' }, end('end')];
+      }
+      // Orchestrator turns:
+      if (!spawnedCoder) {
+        spawnedCoder = true;
+        return [
+          { type: 'tool_call', id: 'c1', name: 'spawn_subagent', args: { role: 'coder', task: 'impl' } },
+          end('tool_calls'),
+        ];
+      }
+      if (!spawnedResearcher) {
+        spawnedResearcher = true;
+        return [
+          { type: 'tool_call', id: 'r1', name: 'spawn_subagent', args: { role: 'researcher', task: 'investigate' } },
+          end('tool_calls'),
+        ];
+      }
+      return [{ type: 'text_delta', text: 'orchestration complete' }, end('end')];
+    });
+
+    const loop = new AgentLoop({
+      gateway: gw,
+      events: store,
+      projectId: 'p1',
+      projectRoot: root,
+      model: 'mock/echo',
+      roles,
+      leaseEpoch: 7,
+      capToken: parentToken,
+      capTokens: observingCapTokens,
+    });
+    const outcome = await loop.run(makeGoal('delegate to coder then researcher'), 'orchestrator');
+    assert.equal(outcome.result.status, 'success');
+    assert.equal(childTokens.length, 2, 'expected one attenuated token per subagent');
+
+    // ---- Coder child: keeps exec + fs.write, drops spawn; strict subset ----
+    const coderTok = svc.verify(childTokens[0]!);
+    assert.ok(coderTok, 'coder child token must verify');
+    const coderCaps = new Set(coderTok!.caps);
+    for (const cap of coderTok!.caps) assert.ok(TOP_LEVEL_CAPS.includes(cap), `coder escalated: ${cap}`);
+    assert.ok(!coderCaps.has('spawn'), 'coder must lose spawn');
+    assert.ok(coderCaps.has('exec'), 'coder keeps exec (has run_bash)');
+    assert.ok(coderCaps.has('fs.write'), 'coder keeps fs.write (has write_file)');
+    assert.ok(coderCaps.has('fs.read') && coderCaps.has('net.fetch'), 'coder keeps read caps');
+    assert.ok(coderCaps.size < TOP_LEVEL_CAPS.length, 'coder is a strict subset');
+
+    // ---- Researcher child: loses exec AND fs.write (and spawn) ----
+    const resTok = svc.verify(childTokens[1]!);
+    assert.ok(resTok, 'researcher child token must verify');
+    const resCaps = new Set(resTok!.caps);
+    for (const cap of resTok!.caps) assert.ok(TOP_LEVEL_CAPS.includes(cap), `researcher escalated: ${cap}`);
+    assert.ok(!resCaps.has('spawn'), 'researcher must lose spawn');
+    assert.ok(!resCaps.has('exec'), 'researcher must lose exec (no run_bash)');
+    assert.ok(!resCaps.has('fs.write'), 'researcher must lose fs.write (no write tool)');
+    assert.ok(resCaps.has('fs.read') && resCaps.has('net.fetch'), 'researcher keeps read caps');
+    assert.deepEqual([...resCaps].sort(), ['fs.read', 'net.fetch']);
+
+    // Inherited, non-escalating run binding on both children.
+    for (const t of [coderTok!, resTok!]) {
+      assert.equal(t.projectId, 'p1');
+      assert.equal(t.runId, 'run1');
+      assert.equal(t.leaseEpoch, 7);
+      assert.equal(t.principalId, 'agt_parent');
+    }
+
+    // ---- Escalation is rejected: attenuate() throws on any cap not in parent ----
+    assert.throws(
+      () => svc.attenuate(childTokens[1]!, ['fs.read', 'exec']),
+      /escalation/i,
+      'attenuating a researcher token back up to exec must throw',
+    );
+    assert.throws(
+      () => svc.attenuate(parentToken, ['spawn', 'secrets.write']),
+      /escalation/i,
+      'attenuating to a cap the parent never held must throw',
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('no token machinery injected: spawn_subagent behaves exactly as Phase 3 (no attenuation)', async () => {
+  const root = await makeRoot();
+  try {
+    const { store, events } = stubEvents();
+    const gw = scriptedGateway((req, call) => {
+      if (req.meta.agentRole === 'coder') {
+        return [{ type: 'text_delta', text: 'sub done' }, end('end')];
+      }
+      if (call === 1) {
+        return [
+          {
+            type: 'tool_call',
+            id: 's1',
+            name: 'spawn_subagent',
+            args: { role: 'coder', task: 'do a thing' },
+          },
+          end('tool_calls'),
+        ];
+      }
+      return [{ type: 'text_delta', text: 'done' }, end('end')];
+    });
+    const loop = new AgentLoop({
+      gateway: gw,
+      events: store,
+      projectId: 'p1',
+      projectRoot: root,
+      model: 'mock/echo',
+    });
+    const outcome = await loop.run(makeGoal('delegate'), 'orchestrator');
+    assert.equal(outcome.result.status, 'success');
+    // task.start carries no `attenuated` flag when no token machinery is wired.
+    const starts = events.filter((e) => e.kind === 'task.start');
+    assert.equal(starts.length, 1);
+    assert.equal((starts[0]!.payload as { attenuated?: boolean }).attenuated, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

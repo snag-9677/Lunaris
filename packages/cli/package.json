@@ -22,6 +22,8 @@
     "@lunaris/optimizer": "workspace:*",
     "@lunaris/plugd": "workspace:*",
     "@lunaris/scheduler": "workspace:*",
+    "@lunaris/identity": "workspace:*",
+    "@lunaris/lifecycle": "workspace:*",
     "commander": "^14.0.0"
   },
   "devDependencies": {

@@ -18,6 +18,11 @@
  *    optimizer (stats + a persisted proposal), the plugin host (scaffold ->
  *    enable -> resolve -> execute), the scheduler goal queue (priority lease),
  *    the cron nextRun, and GET /api/projects/:id/proposals — all offline.
+ * 7. Runs the Phase 4 smoke (scripts/smoke-phase4.mjs) which exercises identity
+ *    + RBAC (owner/viewer auth + capability checks), attenuable capability
+ *    tokens (mint/verify/tamper/attenuate), the lease store + fencing, project
+ *    lifecycle (snapshot/restore + export/import fresh instanceId), the core
+ *    schema doctor, and GET /api/version — all offline.
  *
  * Run from anywhere: node scripts/smoke.mjs — exits 0 on success.
  */
@@ -28,6 +33,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runPhase2Smoke } from './smoke-phase2.mjs';
 import { runPhase3Smoke } from './smoke-phase3.mjs';
+import { runPhase4Smoke } from './smoke-phase4.mjs';
 
 const core = await import(new URL('../packages/core/dist/index.js', import.meta.url).href);
 const gatewayPkg = await import(new URL('../packages/gateway/dist/index.js', import.meta.url).href);
@@ -130,6 +136,10 @@ try {
 
   // ---- 6. Phase 3 substrate (optimizer / plugd / scheduler / cron / route) --
   await runPhase3Smoke();
+
+  // ---- 7. Phase 4 substrate (identity/RBAC, cap tokens, leases/fencing,
+  //         lifecycle snapshot+bundle, core doctor, /api/version) ------------
+  await runPhase4Smoke();
 } finally {
   if (app) await app.close().catch(() => {});
   events?.close?.();

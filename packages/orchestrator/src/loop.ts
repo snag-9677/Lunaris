@@ -68,6 +68,31 @@ export interface ChatGateway {
   chat(req: UnifiedRequest): AsyncIterable<UnifiedEvent>;
 }
 
+/**
+ * Minimal structural capability-token service the loop needs for subagent
+ * attenuation. @lunaris/identity's Ed25519CapabilityTokenService satisfies this
+ * (it implements the core CapabilityTokenService contract). Kept structural so
+ * the orchestrator does not take a hard runtime dependency on the concrete class
+ * and Phase 1-3 callers — who inject no token machinery — stay unaffected.
+ */
+export interface CapTokenService {
+  /** Re-sign a STRICT subset of caps (attenuation only; throws on escalation). */
+  attenuate(signed: string, caps: string[]): string;
+}
+
+/**
+ * Tools whose execution mutates the workspace / outside world and therefore must
+ * be fenced behind a live lease epoch. read_file / list_dir / web_fetch are
+ * read-only and never fenced. spawn_subagent is internal control flow (the
+ * subagent's own side-effecting tools are individually fenced). Any non-built-in
+ * (plugin) tool is treated as side-effecting by default — conservative, since the
+ * loop cannot know a plugin's effects.
+ */
+const SIDE_EFFECTING_BUILTINS = new Set(['write_file', 'apply_patch', 'run_bash']);
+
+/** Caps dropped from a subagent's attenuated token (never escalate). */
+const SUBAGENT_DROP_CAPS = new Set(['spawn']);
+
 export interface AgentLoopOptions {
   gateway: ChatGateway;
   events: EventStore;
@@ -105,6 +130,34 @@ export interface AgentLoopOptions {
    * run proceeds with built-ins only (plugins are additive, never load-bearing).
    */
   pluginHost?: PluginHost;
+  /**
+   * Phase 4 — DISTRIBUTED LEASE + FENCING + CAPABILITY TOKENS (all OPTIONAL;
+   * Phase 1-3 callers/tests are unaffected — without any of these the loop
+   * behaves exactly as Phase 3).
+   */
+  /**
+   * The orchestrator lease epoch this run holds. When set it is stamped onto the
+   * side-effecting events the loop emits (tool.call / memory.proposed) so a
+   * downstream fencing check can reject stale-epoch writes, and it is the epoch
+   * passed to `isFenced` before each side-effecting tool runs.
+   */
+  leaseEpoch?: number;
+  /**
+   * Fencing check the daemon injects (typically backed by
+   * LeaseStore.isCurrentEpoch). Called with `leaseEpoch` immediately before a
+   * side-effecting tool executes. Returning false (lease lost / superseded by a
+   * newer holder) ABORTS the run with a `blocked` ResultEnvelope — the action is
+   * NOT performed. Only consulted when `leaseEpoch` is also set.
+   */
+  isFenced?: (epoch: number) => boolean;
+  /** The signed run capability token (AgentToken wire string) this run holds. */
+  capToken?: string;
+  /**
+   * Capability-token service used to ATTENUATE the run token for subagents
+   * (only shrinks caps; never escalates). Subagent attenuation happens only when
+   * BOTH capTokens and capToken are present; otherwise subagents behave as Phase 3.
+   */
+  capTokens?: CapTokenService;
 }
 
 export interface AgentRunOutcome {
@@ -192,7 +245,8 @@ export class AgentLoop {
     // top-level prompt before the loop runs. The guide-not-oracle header comes
     // from brief() itself; we just frame it as an advisory block.
     const goalForRun = this.injectMemoryBrief(goal);
-    const outcome = await this.runInternal(goalForRun, role, 0, goal.goalId);
+    // The top-level run carries the injected run capability token (if any).
+    const outcome = await this.runInternal(goalForRun, role, 0, goal.goalId, this.opts.capToken);
     // MEMORY WRITE-BACK: curate 1-3 proposals from the outcome (post-run only —
     // subagents never write memory). Emits a memory.proposed event per decision.
     this.curateMemory(goal, outcome);
@@ -260,6 +314,9 @@ export class AgentLoop {
           reason: decision.reason,
           scores: decision.scores,
           ...(decision.recordId !== undefined ? { recordId: decision.recordId } : {}),
+          // Stamp the held lease epoch so a stale-epoch zombie's memory write-back
+          // can be fenced out during reconciliation.
+          ...(this.opts.leaseEpoch !== undefined ? { leaseEpoch: this.opts.leaseEpoch } : {}),
         },
       });
     }
@@ -418,6 +475,100 @@ export class AgentLoop {
     return undefined;
   }
 
+  /**
+   * True iff a tool name mutates the workspace / outside world and so must pass
+   * the lease fence before running. Built-in mutators are the canonical set;
+   * spawn_subagent is internal control flow (its own tools are fenced); any
+   * non-built-in (plugin) tool is treated as side-effecting by default.
+   */
+  private isSideEffecting(name: string): boolean {
+    if (name === 'spawn_subagent') return false;
+    if (SIDE_EFFECTING_BUILTINS.has(name)) return true;
+    // Read-only built-ins are explicitly safe; everything else (plugins) is not.
+    return !builtinTools.has(name);
+  }
+
+  /**
+   * Lease fencing gate. Returns undefined to allow execution, or a blocked
+   * reason string when this run has lost the lease. Only applies to
+   * side-effecting tools when a leaseEpoch + isFenced callback are injected;
+   * without them (Phase 1-3) nothing is fenced.
+   */
+  private checkFenced(call: ToolCallPart): string | undefined {
+    const { leaseEpoch, isFenced } = this.opts;
+    if (leaseEpoch === undefined || isFenced === undefined) return undefined;
+    if (!this.isSideEffecting(call.name)) return undefined;
+    let held: boolean;
+    try {
+      held = isFenced(leaseEpoch);
+    } catch {
+      // A throwing fencing check is treated as "lease lost" — fail safe (do not
+      // perform a side effect we cannot prove we still own the lease for).
+      held = false;
+    }
+    if (held) return undefined;
+    return `lease lost: orchestrator lease epoch ${leaseEpoch} is no longer current; ${call.name} was blocked (a newer holder owns this repo).`;
+  }
+
+  /**
+   * Capability set a subagent of `subRole` should receive: a STRICT subset of
+   * its parent. Drops `spawn` (children cannot spawn further) and narrows fs
+   * writes so a coder that cannot run_bash also loses any `exec` cap. The result
+   * is intersected with the parent's caps by attenuate(), which rejects any cap
+   * not already held — so this can never escalate even if a caller over-asks.
+   */
+  private subagentCaps(parentCaps: string[], subRole: RoleDef): string[] {
+    const allowsExec = subRole.tools.includes('run_bash');
+    const allowsWrite =
+      subRole.tools.includes('write_file') || subRole.tools.includes('apply_patch');
+    return parentCaps.filter((cap) => {
+      if (SUBAGENT_DROP_CAPS.has(cap)) return false; // never let a child spawn
+      if (!allowsExec && cap === 'exec') return false; // narrow: no exec if no run_bash
+      if (!allowsWrite && (cap === 'fs.write' || cap.startsWith('fs.write:'))) return false;
+      return true;
+    });
+  }
+
+  /**
+   * Attenuate the parent run token for a subagent. Returns the signed child
+   * token, or undefined when no token machinery is wired (Phase 1-3 behaviour).
+   * attenuate() throws on escalation; a child token is always a subset of its
+   * parent's caps.
+   */
+  private attenuateForSubagent(
+    parentToken: string | undefined,
+    subRole: RoleDef,
+  ): string | undefined {
+    const svc = this.opts.capTokens;
+    if (svc === undefined || parentToken === undefined) return undefined;
+    const parentCaps = this.parentCapsOf(parentToken);
+    const childCaps = this.subagentCaps(parentCaps, subRole);
+    return svc.attenuate(parentToken, childCaps);
+  }
+
+  /**
+   * Best-effort decode of a token's caps for computing the attenuated subset.
+   * The token is base64url(payloadJSON).base64url(sig); we read the payload's
+   * caps WITHOUT trusting it for authorization (attenuate() re-verifies the
+   * signature and rejects any cap not actually present). On any parse failure we
+   * fall back to an empty set, so the child can only LOSE caps.
+   */
+  private parentCapsOf(token: string): string[] {
+    const dot = token.indexOf('.');
+    const seg = dot > 0 ? token.slice(0, dot) : token;
+    try {
+      const decoded = JSON.parse(Buffer.from(seg, 'base64url').toString('utf8')) as {
+        caps?: unknown;
+      };
+      if (Array.isArray(decoded.caps)) {
+        return decoded.caps.filter((c): c is string => typeof c === 'string');
+      }
+    } catch {
+      // fall through
+    }
+    return [];
+  }
+
   private roles(): Record<string, RoleDef> {
     return this.opts.roles ?? builtinRoles;
   }
@@ -449,13 +600,14 @@ export class AgentLoop {
     roleName: string,
     depth: number,
     taskId: string,
+    capToken: string | undefined,
   ): Promise<AgentRunOutcome> {
     const role = this.roles()[roleName];
     if (role === undefined) {
       return this.outcome(goal, taskId, '', 'failed', `unknown role: ${roleName}`, 'infra');
     }
     try {
-      return await this.iterate(goal, role, depth, taskId);
+      return await this.iterate(goal, role, depth, taskId, capToken);
     } catch (e) {
       // The loop itself should never throw; anything that escapes is infrastructure.
       return this.outcome(goal, taskId, '', 'failed', `internal error: ${errorMessage(e)}`, 'infra');
@@ -467,6 +619,7 @@ export class AgentLoop {
     role: RoleDef,
     depth: number,
     taskId: string,
+    capToken: string | undefined,
   ): Promise<AgentRunOutcome> {
     const { projectId } = this.opts;
     const maxIterations = role.maxIterations ?? DEFAULT_MAX_ITERATIONS;
@@ -555,12 +708,40 @@ export class AgentLoop {
           continue;
         }
 
+        // LEASE FENCING: before a side-effecting tool runs, confirm this run still
+        // holds the lease at the stamped epoch. A lost/superseded lease (isFenced
+        // returns false) means a newer holder owns the repo — abort WITHOUT
+        // performing the action, as `blocked` (NOT an infra failure: the loop and
+        // tools are healthy; we are simply fenced out).
+        const fenced = this.checkFenced(call);
+        if (fenced !== undefined) {
+          await journal({
+            kind: 'lease.fenced',
+            iteration,
+            name: call.name,
+            leaseEpoch: this.opts.leaseEpoch,
+            reason: fenced,
+          });
+          this.opts.events.append({
+            projectId,
+            kind: 'lease.fenced',
+            taskId,
+            agentId: role.name,
+            payload: {
+              name: call.name,
+              ...(this.opts.leaseEpoch !== undefined ? { leaseEpoch: this.opts.leaseEpoch } : {}),
+              reason: fenced,
+            },
+          });
+          return this.outcome(goal, taskId, lastText, 'blocked', fenced, undefined, journalPath);
+        }
+
         const startedAt = Date.now();
         let content: string;
         let isError = false;
         let infraError: string | undefined;
         try {
-          content = await this.executeToolCall(call, role, depth);
+          content = await this.executeToolCall(call, role, depth, capToken);
         } catch (e) {
           isError = true;
           if (e instanceof ToolError) {
@@ -577,12 +758,21 @@ export class AgentLoop {
           this.markTaintFor(call, taskId);
         }
         const durationMs = Date.now() - startedAt;
+        // Stamp the held lease epoch on side-effecting tool.call events so a
+        // downstream consumer can fence stale-epoch writes during reconciliation.
+        const stampEpoch = this.opts.leaseEpoch !== undefined && this.isSideEffecting(call.name);
         this.opts.events.append({
           projectId,
           kind: 'tool.call',
           taskId,
           agentId: role.name,
-          payload: { name: call.name, args: summarizeArgs(call.args), durationMs, ok: !isError },
+          payload: {
+            name: call.name,
+            args: summarizeArgs(call.args),
+            durationMs,
+            ok: !isError,
+            ...(stampEpoch ? { leaseEpoch: this.opts.leaseEpoch } : {}),
+          },
         });
         await journal({
           kind: 'tool.call',
@@ -657,7 +847,12 @@ export class AgentLoop {
     return { text, toolCalls, stopReason, usage, error };
   }
 
-  private async executeToolCall(call: ToolCallPart, role: RoleDef, depth: number): Promise<string> {
+  private async executeToolCall(
+    call: ToolCallPart,
+    role: RoleDef,
+    depth: number,
+    capToken: string | undefined,
+  ): Promise<string> {
     if (!role.tools.includes(call.name)) {
       throw new ToolError(`tool not allowed for role "${role.name}": ${call.name}`);
     }
@@ -665,7 +860,7 @@ export class AgentLoop {
       if (depth >= MAX_SPAWN_DEPTH) {
         throw new ToolError('spawn_subagent is not available to subagents (max depth 1)');
       }
-      return this.spawnSubagent(call.args, depth);
+      return this.spawnSubagent(call.args, depth, capToken);
     }
     const ctx = {
       projectId: this.opts.projectId,
@@ -687,7 +882,11 @@ export class AgentLoop {
   }
 
   /** spawn_subagent: run a nested AgentLoop (depth max 1) and return its final text. */
-  private async spawnSubagent(args: unknown, depth: number): Promise<string> {
+  private async spawnSubagent(
+    args: unknown,
+    depth: number,
+    parentToken: string | undefined,
+  ): Promise<string> {
     const roleName = requireStringArg(args, 'role');
     const task = requireStringArg(args, 'task');
     const subRole = this.roles()[roleName];
@@ -703,16 +902,28 @@ export class AgentLoop {
       createdAt: new Date().toISOString(),
       status: 'running',
     };
+
+    // SUBAGENT ATTENUATION: derive a STRICTLY narrower capability token for the
+    // child by attenuating the parent — drop `spawn` (children cannot spawn) and
+    // narrow fs writes to the subrole's allowlist. attenuate() throws on any
+    // escalation, so the child token can only ever be a subset of the parent's.
+    // Without both the service and a parent token, the subagent runs token-less
+    // exactly as Phase 3.
+    const childToken = this.attenuateForSubagent(parentToken, subRole);
     this.opts.events.append({
       projectId: this.opts.projectId,
       kind: 'task.start',
       taskId,
       agentId: roleName,
-      payload: { role: roleName, task: truncate(task, 500) },
+      payload: {
+        role: roleName,
+        task: truncate(task, 500),
+        ...(childToken !== undefined ? { attenuated: true } : {}),
+      },
     });
 
     // runInternal never throws; failures come back as a ResultEnvelope.
-    const outcome = await this.runInternal(subGoal, roleName, depth + 1, taskId);
+    const outcome = await this.runInternal(subGoal, roleName, depth + 1, taskId, childToken);
     this.opts.events.append({
       projectId: this.opts.projectId,
       kind: 'task.end',

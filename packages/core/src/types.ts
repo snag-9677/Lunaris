@@ -489,6 +489,168 @@ export interface GoalQueue {
   list(projectId?: string, status?: QueuedGoalStatus): QueuedGoal[];
 }
 
+// ---------- Identity, auth, RBAC (Phase 4: lunaris-id) ----------
+
+export type PrincipalKind = 'user' | 'node' | 'agent' | 'service';
+
+export interface Principal {
+  id: string; // usr_/node_/agt_/svc_ + ulid
+  kind: PrincipalKind;
+  displayName: string;
+  createdAt: string;
+  status: 'active' | 'suspended';
+  /** agent principals are parented to the user/service that started the run. */
+  parentId?: string;
+}
+
+/** RBAC role (distinct from the chat-message Role and subagent RoleDef). */
+export type RbacRole = 'owner' | 'maintainer' | 'operator' | 'viewer' | 'auditor';
+
+export interface RoleBinding {
+  principalId: string;
+  scope: string; // 'global' | 'project:<id>'
+  role: RbacRole;
+}
+
+/** Dangerous powers gated by RBAC + (some) step-up. */
+export type Capability =
+  | 'project.read'
+  | 'goal.submit'
+  | 'kill_switch'
+  | 'resume'
+  | 'approve'
+  | 'change_autonomy'
+  | 'secrets.read'
+  | 'secrets.write'
+  | 'providers.write'
+  | 'memory.prune'
+  | 'optimizer.promote'
+  | 'fleet.manage';
+
+export interface Session {
+  id: string;
+  principalId: string;
+  createdAt: string;
+  expiresAt: string;
+  /** last step-up (fresh second factor) timestamp, for dangerous ops. */
+  stepUpAt?: string;
+}
+
+export interface AuthResult {
+  ok: boolean;
+  principal?: Principal;
+  session?: Session;
+  /** opaque bearer token for CLI/API (UI uses cookies in a full deployment). */
+  token?: string;
+  reason?: string;
+}
+
+/** Identity + RBAC control plane (embedded by default). */
+export interface IdentityStore {
+  createUser(displayName: string, password?: string): Principal;
+  authenticate(displayName: string, password: string, now?: Date): AuthResult;
+  /** Validate a bearer token → its live session + principal. */
+  resolveToken(token: string, now?: Date): { principal: Principal; session: Session } | null;
+  bind(principalId: string, scope: string, role: RbacRole): void;
+  roleFor(principalId: string, projectId: string): RbacRole | null;
+  can(principalId: string, projectId: string, cap: Capability): boolean;
+  revokeSession(sessionId: string): void;
+}
+
+/**
+ * Attenuable agent capability token (spec §15): minted per run, scoped to a
+ * project/run/lease-epoch + a capability set. Subagents ATTENUATE (only shrink
+ * the cap set), never escalate. Verified offline against the signing key.
+ */
+export interface AgentToken {
+  principalId: string; // agt_*
+  projectId: string;
+  runId: string;
+  leaseEpoch: number;
+  caps: string[]; // e.g. ['fs.write:/repo', 'exec', 'net', 'provider:ollama', 'spawn']
+  expiresAt: string;
+}
+
+export interface CapabilityTokenService {
+  mint(t: Omit<AgentToken, 'expiresAt'> & { ttlMs?: number }): string; // signed string
+  /** Verify signature + expiry; returns the decoded token or null. */
+  verify(signed: string, now?: Date): AgentToken | null;
+  /** Re-sign a strict subset of caps (attenuation only; rejects escalation). */
+  attenuate(signed: string, caps: string[]): string;
+}
+
+// ---------- Distributed orchestrator lease + fencing (Phase 4) ----------
+
+export interface Lease {
+  repoId: string;
+  holderId: string; // the orchestrator run/principal holding it
+  nodeId: string;
+  epoch: number; // monotonic; increments on each fresh acquisition
+  acquiredAt: string;
+  heartbeatAt: string;
+  ttlMs: number;
+}
+
+/**
+ * One-orchestrator-per-repo lease with fencing (replaces a plain lockfile).
+ * Side-effecting writes are stamped with the held epoch; a stale epoch is
+ * rejected so a paused-then-resumed zombie can't clobber a newer holder.
+ */
+export interface LeaseStore {
+  /** Acquire if free or expired; null if a fresh lease is held by another. */
+  acquire(repoId: string, holderId: string, nodeId: string, now?: Date): Lease | null;
+  heartbeat(repoId: string, holderId: string, now?: Date): boolean;
+  release(repoId: string, holderId: string): void;
+  current(repoId: string, now?: Date): Lease | null;
+  /** True iff epoch matches the current lease (fencing check before a write). */
+  isCurrentEpoch(repoId: string, epoch: number, now?: Date): boolean;
+}
+
+// ---------- Lifecycle: snapshot / restore / bundle / identity v2 (Phase 4) ----------
+
+/** T0 committed · T1 instance · T2 cache · T3 secret · T4 derived. */
+export type StateTier = 'committed' | 'instance' | 'cache' | 'secret' | 'derived';
+
+export interface SnapshotInfo {
+  id: string;
+  projectId: string;
+  createdAt: string;
+  bytes: number;
+  kind: 'full' | 'pre-op';
+  path: string;
+}
+
+export interface BundleManifest {
+  formatVersion: number;
+  /** committed lineage id (travels with clones). */
+  projectId: string;
+  name: string;
+  createdAt: string;
+  contents: string[]; // subsystem state included
+  schemaVersions: Record<string, number>;
+}
+
+/** Two-level identity: committed lineage projectId + machine-local instanceId. */
+export interface ProjectIdentity {
+  projectId: string; // committed, in lunaris.toml
+  instanceId: string; // minted per machine; keys secrets + local state
+  fingerprint?: string; // canonical remote + root commit, for fork detection
+}
+
+// ---------- Schema migration / versioning (Phase 4) ----------
+
+export interface VersionInfo {
+  harness: string; // semver of the binary
+  schemaVersions: Record<string, number>; // per-store ('events','memory',...)
+}
+
+export interface MigrationStep {
+  store: string;
+  from: number;
+  to: number;
+  description: string;
+}
+
 // ---------- Manifest (lunaris.toml) ----------
 
 export interface ProviderConfig {

@@ -26,6 +26,12 @@ importers:
       '@lunaris/gateway':
         specifier: workspace:*
         version: link:../gateway
+      '@lunaris/identity':
+        specifier: workspace:*
+        version: link:../identity
+      '@lunaris/lifecycle':
+        specifier: workspace:*
+        version: link:../lifecycle
       '@lunaris/memory':
         specifier: workspace:*
         version: link:../memory
@@ -85,6 +91,12 @@ importers:
       '@lunaris/gateway':
         specifier: workspace:*
         version: link:../gateway
+      '@lunaris/identity':
+        specifier: workspace:*
+        version: link:../identity
+      '@lunaris/lifecycle':
+        specifier: workspace:*
+        version: link:../lifecycle
       '@lunaris/memory':
         specifier: workspace:*
         version: link:../memory
@@ -115,6 +127,32 @@ importers:
         version: 5.9.3
 
   packages/gateway:
+    dependencies:
+      '@lunaris/core':
+        specifier: workspace:*
+        version: link:../core
+    devDependencies:
+      '@types/node':
+        specifier: ^24.0.0
+        version: 24.13.1
+      typescript:
+        specifier: ^5.9.0
+        version: 5.9.3
+
+  packages/identity:
+    dependencies:
+      '@lunaris/core':
+        specifier: workspace:*
+        version: link:../core
+    devDependencies:
+      '@types/node':
+        specifier: ^24.0.0
+        version: 24.13.1
+      typescript:
+        specifier: ^5.9.0
+        version: 5.9.3
+
+  packages/lifecycle:
     dependencies:
       '@lunaris/core':
         specifier: workspace:*
@@ -164,6 +202,9 @@ importers:
       '@lunaris/gateway':
         specifier: workspace:*
         version: link:../gateway
+      '@lunaris/identity':
+        specifier: workspace:*
+        version: link:../identity
       '@lunaris/memory':
         specifier: workspace:*
         version: link:../memory

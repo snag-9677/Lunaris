@@ -5,6 +5,7 @@
  * stays in App.tsx.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { authFetch, getJson } from '../api.js';
 
 /* ---------- shared types (mirror @lunaris/core; UI stays dep-free) ---------- */
 
@@ -128,13 +129,7 @@ interface QueuedGoal {
   goalId?: string;
 }
 
-/* ---------- fetch helper ---------- */
-
-async function getJson<T>(url: string): Promise<T> {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`${url} → ${res.status}`);
-  return (await res.json()) as T;
-}
+/* ---------- formatting helpers (fetch helpers live in ../api) ---------- */
 
 function fmtUsd(n: number): string {
   return `$${n.toFixed(n < 1 ? 4 : 2)}`;
@@ -395,7 +390,7 @@ export function ApprovalsPanel({ projectId }: { projectId: string }) {
     async (ticketId: string, approved: boolean) => {
       setBusy(ticketId);
       try {
-        const res = await fetch(`/api/approvals/${encodeURIComponent(ticketId)}/resolve`, {
+        const res = await authFetch(`/api/approvals/${encodeURIComponent(ticketId)}/resolve`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ approved, by: 'ui', projectId }),
@@ -487,7 +482,7 @@ export function OptimizePanel({ projectId }: { projectId: string }) {
     if (!projectId) return;
     setRunning(true);
     try {
-      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/optimize`, {
+      const res = await authFetch(`/api/projects/${encodeURIComponent(projectId)}/optimize`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({}),
@@ -508,7 +503,7 @@ export function OptimizePanel({ projectId }: { projectId: string }) {
     async (id: string, approved: boolean) => {
       setBusy(id);
       try {
-        const res = await fetch(`/api/proposals/${encodeURIComponent(id)}/resolve`, {
+        const res = await authFetch(`/api/proposals/${encodeURIComponent(id)}/resolve`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ approved, projectId }),
@@ -658,7 +653,7 @@ export function PluginsPanel({ projectId }: { projectId: string }) {
       setBusy(id);
       try {
         const action = enable ? 'enable' : 'disable';
-        const res = await fetch(
+        const res = await authFetch(
           `/api/projects/${encodeURIComponent(projectId)}/plugins/${encodeURIComponent(id)}/${action}`,
           { method: 'POST' },
         );
@@ -741,7 +736,7 @@ export function AutomationPanel({ projectId }: { projectId: string }) {
   const addSchedule = useCallback(async () => {
     if (!projectId || cron.trim().length === 0 || prompt.trim().length === 0) return;
     try {
-      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/schedules`, {
+      const res = await authFetch(`/api/projects/${encodeURIComponent(projectId)}/schedules`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ cron: cron.trim(), prompt: prompt.trim() }),
@@ -757,7 +752,7 @@ export function AutomationPanel({ projectId }: { projectId: string }) {
   const removeSchedule = useCallback(
     async (id: string) => {
       try {
-        const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/schedules/${encodeURIComponent(id)}`, {
+        const res = await authFetch(`/api/projects/${encodeURIComponent(projectId)}/schedules/${encodeURIComponent(id)}`, {
           method: 'DELETE',
         });
         if (!res.ok) throw new Error(`remove → ${res.status}`);
@@ -822,6 +817,245 @@ export function AutomationPanel({ projectId }: { projectId: string }) {
             <span className="mem-meta">p{g.priority}</span>
             <span className="mem-meta">{g.source}</span>
             <span className="queue-prompt">{g.prompt}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Phase 4 shared types ---------- */
+
+interface VersionInfo {
+  harness: string;
+  schemaVersions: Record<string, number>;
+}
+
+interface StoreReport {
+  store: string;
+  path: string;
+  present: boolean;
+  version: number | null;
+  expected: number | null;
+  status: 'ok' | 'behind' | 'ahead' | 'missing';
+}
+
+interface DoctorReport {
+  harness: string;
+  stores: StoreReport[];
+}
+
+interface SnapshotInfo {
+  id: string;
+  projectId: string;
+  createdAt: string;
+  bytes: number;
+  kind: 'full' | 'pre-op';
+  path: string;
+}
+
+interface LeaseInfo {
+  repoId: string;
+  holderId: string;
+  nodeId: string;
+  epoch: number;
+  acquiredAt: string;
+  heartbeatAt: string;
+}
+
+function fmtBytes(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}MB`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}kB`;
+  return `${n}B`;
+}
+
+/* ---------- System: version + schema doctor, lease, snapshots, export ---------- */
+
+export function SystemPanel({ projectId }: { projectId: string }) {
+  const [version, setVersion] = useState<VersionInfo | null>(null);
+  const [doctor, setDoctor] = useState<DoctorReport | null>(null);
+  const [lease, setLease] = useState<LeaseInfo | null>(null);
+  const [snapshots, setSnapshots] = useState<SnapshotInfo[]>([]);
+  const [error, setError] = useState<string | undefined>();
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<string | undefined>();
+
+  const load = useCallback(async () => {
+    try {
+      const ver = await getJson<{ version: VersionInfo; doctor: DoctorReport }>('/api/version');
+      setVersion(ver.version);
+      setDoctor(ver.doctor);
+      setError(undefined);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+    if (!projectId) {
+      setSnapshots([]);
+      setLease(null);
+      return;
+    }
+    try {
+      const snaps = await getJson<{ snapshots: SnapshotInfo[] }>(
+        `/api/projects/${encodeURIComponent(projectId)}/snapshots`,
+      );
+      setSnapshots(snaps.snapshots);
+    } catch {
+      setSnapshots([]);
+    }
+    // The lease holder is read off the global doctor's version route; a
+    // dedicated lease endpoint isn't required for display, so we surface what
+    // /api/version reports plus the per-project snapshots. Lease holder info is
+    // only shown when present in a future /lease route; left null otherwise.
+    setLease(null);
+  }, [projectId]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const createSnapshot = useCallback(async () => {
+    if (!projectId) return;
+    setBusy(true);
+    setNote(undefined);
+    try {
+      const res = await authFetch(`/api/projects/${encodeURIComponent(projectId)}/snapshot`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ kind: 'full' }),
+      });
+      if (!res.ok) throw new Error(`snapshot → ${res.status}`);
+      const info = (await res.json()) as SnapshotInfo;
+      setSnapshots((prev) => [info, ...prev]);
+      setNote(`created snapshot ${info.id.slice(0, 12)}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }, [projectId]);
+
+  const restoreDryRun = useCallback(
+    async (snapshotId: string) => {
+      if (!projectId) return;
+      setBusy(true);
+      setNote(undefined);
+      try {
+        const res = await authFetch(`/api/projects/${encodeURIComponent(projectId)}/restore`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ snapshotId, dryRun: true }),
+        });
+        if (!res.ok) throw new Error(`restore → ${res.status}`);
+        const result = (await res.json()) as { restored: string[]; dryRun: boolean };
+        setNote(`dry run: would restore ${result.restored.length} file(s)`);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [projectId],
+  );
+
+  const exportBundle = useCallback(async () => {
+    if (!projectId) return;
+    setBusy(true);
+    setNote(undefined);
+    try {
+      const res = await authFetch(`/api/projects/${encodeURIComponent(projectId)}/export`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      if (!res.ok) throw new Error(`export → ${res.status}`);
+      const out = (await res.json()) as { outPath: string };
+      setNote(`exported bundle → ${out.outPath}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }, [projectId]);
+
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <span>system</span>
+        <button type="button" onClick={() => void load()} disabled={busy}>
+          ↻
+        </button>
+      </div>
+      {error && <div className="error">{error}</div>}
+      {note && <div className="sys-note">{note}</div>}
+      <div className="panel-body">
+        <div className="mem-subhead">harness {version ? `v${version.harness}` : '…'}</div>
+        <table className="tbl">
+          <thead>
+            <tr>
+              <th>store</th>
+              <th className="num">version</th>
+              <th className="num">expected</th>
+              <th>status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(!doctor || doctor.stores.length === 0) && (
+              <tr>
+                <td colSpan={4} className="empty">
+                  no stores found
+                </td>
+              </tr>
+            )}
+            {doctor?.stores.map((s) => (
+              <tr key={s.store}>
+                <td>{s.store}</td>
+                <td className="num">{s.version ?? '-'}</td>
+                <td className="num">{s.expected ?? '-'}</td>
+                <td>
+                  <span className={`badge doctor-${s.status}`}>{s.status}</span>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+
+        <div className="mem-subhead" style={{ marginTop: 14 }}>
+          lease
+        </div>
+        {lease ? (
+          <div className="sys-lease">
+            holder {lease.holderId.slice(0, 12)} · node {lease.nodeId} · epoch {lease.epoch}
+          </div>
+        ) : (
+          <div className="empty">no live lease for this project</div>
+        )}
+
+        <div className="mem-subhead" style={{ marginTop: 14 }}>
+          snapshots ({snapshots.length})
+        </div>
+        <div className="sys-actions">
+          <button type="button" className="approve" disabled={busy || !projectId} onClick={() => void createSnapshot()}>
+            create snapshot
+          </button>
+          <button type="button" disabled={busy || !projectId} onClick={() => void exportBundle()}>
+            export bundle
+          </button>
+        </div>
+        {snapshots.length === 0 && <div className="empty">no snapshots</div>}
+        {snapshots.map((s) => (
+          <div key={s.id} className="sys-snap">
+            <span className={`badge ns-task`}>{s.kind}</span>
+            <span className="sys-snap-id">{s.id.slice(0, 12)}</span>
+            <span className="mem-meta">{fmtBytes(s.bytes)}</span>
+            <span className="mem-meta">{s.createdAt}</span>
+            <button
+              type="button"
+              className="sys-restore"
+              disabled={busy}
+              onClick={() => void restoreDryRun(s.id)}
+            >
+              restore (dry-run)
+            </button>
           </div>
         ))}
       </div>

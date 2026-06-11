@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import test from 'node:test';
 import * as core from '@lunaris/core';
 import type { EventEnvelope } from '@lunaris/core';
-import { buildServer } from './server.js';
+import { SqliteIdentityStore } from '@lunaris/identity';
+import { buildServer, redactTicketParam } from './server.js';
 
 interface TestEnv {
   dir: string;
@@ -186,6 +187,115 @@ test('WS /api/ws streams appended events as JSON', async () => {
   } finally {
     ws?.close();
     await app.close();
+    env.cleanup();
+  }
+});
+
+test('FIX 3: redactTicketParam strips the ticket value from a URL', () => {
+  assert.equal(redactTicketParam('/api/ws?ticket=secret-token'), '/api/ws?ticket=[REDACTED]');
+  assert.equal(
+    redactTicketParam('/api/ws?foo=1&ticket=abc123&bar=2'),
+    '/api/ws?foo=1&ticket=[REDACTED]&bar=2',
+  );
+  // No ticket param: URL is unchanged.
+  assert.equal(redactTicketParam('/api/projects?limit=10'), '/api/projects?limit=10');
+});
+
+/**
+ * Open a WS to `wsUrl` and resolve true iff it AUTHENTICATES — i.e. it stays
+ * open past a short settle window. The HTTP upgrade (101) completes regardless,
+ * so a rejected connection fires `onopen` and is then immediately closed by the
+ * server with code 1008; we therefore treat a close (or error) within the
+ * settle window as "rejected", and survival past it as "authorized".
+ */
+function tryWsConnect(wsUrl: string): Promise<boolean> {
+  interface WsLike {
+    onopen: ((ev: unknown) => void) | null;
+    onclose: ((ev: { code?: number }) => void) | null;
+    onerror: ((ev: unknown) => void) | null;
+    close(): void;
+  }
+  const Ctor = (globalThis as unknown as { WebSocket: new (url: string) => WsLike }).WebSocket;
+  return new Promise<boolean>((resolve) => {
+    const ws = new Ctor(wsUrl);
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const done = (authorized: boolean): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      try {
+        ws.close();
+      } catch {
+        /* ignore */
+      }
+      resolve(authorized);
+    };
+    ws.onopen = () => {
+      // Survive the settle window without a server-initiated close => authorized.
+      timer = setTimeout(() => done(true), 250);
+    };
+    ws.onclose = () => done(false);
+    ws.onerror = () => done(false);
+  });
+}
+
+test('FIX 3: auth ON — bearer token is rejected as a WS ticket; a fresh ws-ticket works once and is rejected on reuse', async () => {
+  const env = makeEnv();
+  const identity = new SqliteIdentityStore(':memory:');
+  const owner = identity.createUser('owner', 'pw');
+  identity.bind(owner.id, 'global', 'owner');
+  const app = await buildServer({
+    registryPath: env.registryPath,
+    eventsDbPath: env.eventsDbPath,
+    authMode: 'on',
+    identity,
+  });
+  try {
+    const address = await app.listen({ port: 0 });
+    const wsBase = `${address.replace(/^http/, 'ws')}/api/ws`;
+
+    // Log in to obtain the long-lived bearer token.
+    const login = await app.inject({ method: 'POST', url: '/api/login', payload: { user: 'owner', password: 'pw' } });
+    assert.equal(login.statusCode, 200, login.body);
+    const token = (login.json() as { token: string }).token;
+
+    // The bearer token must NOT be accepted as a WS ticket (FIX 3).
+    assert.equal(
+      await tryWsConnect(`${wsBase}?ticket=${encodeURIComponent(token)}`),
+      false,
+      'bearer token must be rejected as a ws ticket',
+    );
+
+    // No ticket at all => rejected.
+    assert.equal(await tryWsConnect(wsBase), false, 'missing ticket must be rejected');
+
+    // Mint a short-lived single-use ws-ticket (requires the bearer in the header).
+    const noAuthTicket = await app.inject({ method: 'POST', url: '/api/ws-ticket' });
+    assert.equal(noAuthTicket.statusCode, 401, 'minting a ws-ticket requires auth');
+
+    const minted = await app.inject({
+      method: 'POST',
+      url: '/api/ws-ticket',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(minted.statusCode, 201, minted.body);
+    const { ticket } = minted.json() as { ticket: string; expiresInMs: number };
+    assert.ok(ticket && ticket.length > 0);
+    assert.notEqual(ticket, token, 'ws-ticket must be distinct from the bearer token');
+
+    // The fresh ticket opens the socket exactly once.
+    assert.equal(await tryWsConnect(`${wsBase}?ticket=${encodeURIComponent(ticket)}`), true, 'fresh ticket must work');
+
+    // Re-using the same ticket is rejected (single-use).
+    assert.equal(
+      await tryWsConnect(`${wsBase}?ticket=${encodeURIComponent(ticket)}`),
+      false,
+      'a consumed ticket must be rejected on reuse',
+    );
+  } finally {
+    await app.close();
+    identity.close();
     env.cleanup();
   }
 });

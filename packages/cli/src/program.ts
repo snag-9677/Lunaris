@@ -20,6 +20,16 @@ import {
   runSchedule,
   runStatus,
 } from './commands.js';
+import {
+  runAdopt,
+  runExport,
+  runLease,
+  runLogin,
+  runRestore,
+  runSnapshot,
+  runVersion,
+  runWhoami,
+} from './phase4.js';
 import { parseTail } from './format.js';
 
 export function buildProgram(): Command {
@@ -185,6 +195,71 @@ export function buildProgram(): Command {
       const priority = Number.isFinite(priorityNum) ? priorityNum : 0;
       const push = action === 'push' ? promptParts.join(' ') : undefined;
       process.exitCode = await runQueue(process.cwd(), { push, priority });
+    });
+
+  // ---- Phase 4: auth / lifecycle / lease / version ----
+
+  program
+    .command('login')
+    .description('Authenticate against the local identity store and cache a bearer token')
+    .option('--user <user>', 'user display name', 'local')
+    .option('--password <password>', 'password (omit for the passwordless loopback owner)')
+    .action(async (opts: { user?: string; password?: string }) => {
+      process.exitCode = await runLogin(opts);
+    });
+
+  program
+    .command('whoami')
+    .description('Show the current principal (cached token or implicit loopback owner) and role')
+    .action(async () => {
+      process.exitCode = await runWhoami(process.cwd());
+    });
+
+  program
+    .command('snapshot')
+    .description('List project snapshots, or create one (create)')
+    .argument('[action]', 'list (default) or create')
+    .action(async (action: string | undefined) => {
+      const a = action === 'create' ? 'create' : 'list';
+      process.exitCode = await runSnapshot(process.cwd(), { action: a });
+    });
+
+  program
+    .command('restore')
+    .description('Restore a snapshot by id (use --dry-run to preview the file list)')
+    .argument('<id>', 'snapshot id')
+    .option('--dry-run', 'list files that would be restored without writing')
+    .action(async (id: string, opts: { dryRun?: boolean }) => {
+      process.exitCode = await runRestore(process.cwd(), id, opts.dryRun === true);
+    });
+
+  program
+    .command('export')
+    .description('Export a portable project bundle (.tar.gz)')
+    .option('--out <path>', 'output bundle path')
+    .action(async (opts: { out?: string }) => {
+      process.exitCode = await runExport(process.cwd(), opts.out);
+    });
+
+  program
+    .command('adopt')
+    .description('Adopt the project in the current directory (mint a machine-local instance id)')
+    .action(async () => {
+      process.exitCode = await runAdopt(process.cwd());
+    });
+
+  program
+    .command('lease')
+    .description('Show the current orchestrator lease holder + epoch for this project')
+    .action(async () => {
+      process.exitCode = await runLease(process.cwd());
+    });
+
+  program
+    .command('version')
+    .description('Show the harness version and a per-store schema doctor table')
+    .action(async () => {
+      process.exitCode = await runVersion(process.cwd());
     });
 
   return program;

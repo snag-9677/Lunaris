@@ -15,4 +15,5 @@ export {
   type ChatGateway,
   type TaintSink,
   type ApprovalSink,
+  type CapTokenService,
 } from './loop.js';

@@ -16,3 +16,25 @@ export {
 } from './phase3.js';
 export { startSchedulerLoop } from './scheduler-loop.js';
 export type { SchedulerLoopHandle, StartSchedulerLoopOptions } from './scheduler-loop.js';
+export { LeaseHeldError, acquireRunLease, withLease } from './goal-runner.js';
+export type { GoalLeaseRuntime, AcquiredLease } from './goal-runner.js';
+export {
+  resolveAuthMode,
+  defaultIdentityDbPath,
+  setupIdentity,
+  capabilityForRoute,
+  projectIdFromPath,
+  bearerFromRequest,
+} from './auth.js';
+export type { AuthMode, AuthContext, IdentityLike, IdentitySetup } from './auth.js';
+export {
+  leasesDbPath,
+  agentKeyPath,
+  makeLeaseRuntime,
+  buildVersionReport,
+  projectStorePaths,
+  globalStorePaths,
+} from './phase4.js';
+export type { LeaseRuntime } from './phase4.js';
+export { loadLifecyclePkg } from './lifecycle-routes.js';
+export type { LifecyclePkgLike } from './lifecycle-routes.js';
