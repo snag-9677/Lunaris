@@ -6,4 +6,5 @@ dist/
 .lunaris/memory/
 *.local.toml
 .env
+.aienv
 .DS_Store

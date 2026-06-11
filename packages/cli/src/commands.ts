@@ -180,6 +180,8 @@ export async function runChat(cwd: string, prompt: string, modelOverride?: strin
     const events = await openEventStore(cwd);
 
     const core = await loadModule('@lunaris/core');
+    // Load per-project .aienv (provider keys) before the gateway resolves keys.
+    (core as { applyProjectEnv?: (dir: string) => string[] }).applyProjectEnv?.(cwd);
     const gatewayMod = await loadModule('@lunaris/gateway');
     const LedgerCtor = pick<BudgetLedgerCtor>(
       { ...core, ...gatewayMod },

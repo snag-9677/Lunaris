@@ -6,3 +6,4 @@ export * from './analytics.js';
 export * from './version.js';
 export * from './migrate.js';
 export * from './doctor.js';
+export * from './env.js';

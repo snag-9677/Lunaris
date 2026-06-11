@@ -7,6 +7,7 @@ import { basename, join, resolve } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
 import { z } from 'zod';
 import { uuidv7 } from './ids.js';
+import { PROJECT_ENV_FILE, PROJECT_ENV_SAMPLE, sampleEnvFile } from './env.js';
 import type { LunarisManifest } from './types.js';
 
 /** "<provider>/<model>", e.g. "anthropic/claude-sonnet-4-6", "ollama/qwen3:8b". */
@@ -148,5 +149,22 @@ export function initManifest(
 
   const id = uuidv7();
   writeFileSync(manifestPath, starterToml(id, name), 'utf8');
+
+  // Per-project env: write a .aienv.sample to copy, and gitignore the real .aienv.
+  const samplePath = join(projectDir, PROJECT_ENV_SAMPLE);
+  if (!existsSync(samplePath)) writeFileSync(samplePath, sampleEnvFile(), 'utf8');
+  ensureGitignored(projectDir, PROJECT_ENV_FILE);
+
   return loadManifest(projectDir);
+}
+
+/** Append an entry to <dir>/.gitignore if not already present (creates the file). */
+function ensureGitignored(projectDir: string, entry: string): void {
+  const gitignorePath = join(projectDir, '.gitignore');
+  let current = '';
+  if (existsSync(gitignorePath)) current = readFileSync(gitignorePath, 'utf8');
+  const lines = current.split(/\r?\n/).map((l) => l.trim());
+  if (lines.includes(entry)) return;
+  const prefix = current === '' || current.endsWith('\n') ? '' : '\n';
+  writeFileSync(gitignorePath, `${current}${prefix}${entry}\n`, 'utf8');
 }

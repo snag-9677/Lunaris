@@ -1,0 +1,20 @@
+# Lunaris per-project environment — copy to .aienv and fill in.
+#
+#   cp .aienv.sample .aienv     # then edit, fill in the keys you use
+#
+# .aienv is gitignored; never commit real keys. The harness loads it per
+# project (CLI `lunaris chat` from the project dir; the daemon per goal run)
+# and merges it into the environment WITHOUT overwriting anything already
+# exported in your shell. Each provider in lunaris.toml names its key var
+# via keyEnv — these are the defaults.
+
+# Anthropic (Claude)
+ANTHROPIC_API_KEY=
+
+# DeepSeek
+DEEPSEEK_API_KEY=
+
+# OpenAI / OpenAI-compatible endpoints
+OPENAI_API_KEY=
+
+# Ollama is local and needs no key (set baseUrl in lunaris.toml).

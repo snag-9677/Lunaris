@@ -16,6 +16,7 @@
  * here through narrow structural casts. If a sibling package settles on a
  * different shape, this file is the single place to adjust.
  */
+import { applyProjectEnv } from '@lunaris/core';
 import type {
   ApprovalTicket,
   AutonomyLevel,
@@ -338,6 +339,8 @@ export const defaultGoalRunner: GoalRunner = async ({
   lease,
   acquiredLease,
 }) => {
+  // Load the project's .aienv (provider keys) before the gateway resolves keys.
+  applyProjectEnv(projectRoot);
   const ledger = new InMemoryBudgetLedger(manifest.budgets ?? {});
   const gateway = new ModelGateway({ manifest, events, ledger });
 

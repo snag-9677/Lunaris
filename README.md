@@ -45,13 +45,17 @@ lunaris events --tail 20
 
 ### 2. Wire a real model
 
-Edit `lunaris.toml` → `[models] default`, then export the key the manifest names:
+Edit `lunaris.toml` → `[models] default`, then put the key in the project's `.aienv` file (`lunaris init` already scaffolded `.aienv.sample` and gitignored `.aienv`):
 
 ```sh
-export ANTHROPIC_API_KEY=sk-ant-...      # or DEEPSEEK_API_KEY, OPENAI_API_KEY
+cp .aienv.sample .aienv          # then edit and fill in the keys you use
+#   ANTHROPIC_API_KEY=sk-ant-...
+#   DEEPSEEK_API_KEY=...
 # (Ollama needs no key — just a running local server)
 lunaris chat "add a /health endpoint and a test for it"
 ```
+
+`.aienv` is loaded per project — by the CLI from the project dir, by the daemon per goal run — and merged into the environment **without overwriting** anything already exported in your shell (so a real `export` still wins, and CI can inject keys the usual way). Keys are never written to `lunaris.toml`, logs, or the event spine.
 
 ### 3. Daemon + Mission Control UI
 
@@ -107,6 +111,8 @@ perDayUsd  = 10.0                          # enforced transactionally by the gat
 
 **Providers:** Anthropic, OpenAI, DeepSeek and any OpenAI-compatible endpoint (via `baseUrl`), Ollama (local), plus `mock/echo` for offline runs. Budgets are reserved at call admission and settled on completion — concurrent subagents can't collectively overshoot a cap.
 
+**API keys — `.aienv` (per project, preferred):** copy `.aienv.sample` → `.aienv` and fill in the key names your providers reference. The harness loads it per project and merges into the environment without overwriting existing exports. `.aienv` is gitignored. Shell `export` and CI-injected env vars also work and take precedence.
+
 ### Autonomy policy — `.lunaris/policy.yaml` (optional)
 
 Controls what agents may do without asking. Four levels: `0` read-only · `1` supervised · `2` autonomous-in-workspace (default) · `3` full-auto. Rules are `allow` / `deny` / `queue`; irreversible actions (git push, deploy, publish, `rm -rf` outside the repo) always queue for approval regardless of level, and untrusted (tainted) content tightens the profile automatically.
@@ -131,7 +137,7 @@ Resolve queued actions with `lunaris approvals` or the UI approval inbox.
 | `LUNARIS_AUTH` | `on` enables auth/RBAC on the daemon API | `off` (loopback single-owner) |
 | `LUNARIS_WEBHOOK_SECRET` | HMAC secret for `/hooks/:project/:source` | — (loopback-only without it) |
 | `LUNARIS_WEBHOOK_SECRET_<PROJECTID>` | per-project webhook secret override | — |
-| `ANTHROPIC_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` | provider keys (names are whatever `keyEnv` says) | — |
+| `ANTHROPIC_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` | provider keys (names are whatever `keyEnv` says); set via `.aienv` or shell export | — |
 
 ---
 
@@ -173,6 +179,8 @@ The daemon binds `127.0.0.1` only and refuses any non-loopback host. With `LUNAR
 
 ```
 lunaris.toml                 # committed manifest
+.aienv.sample                # committed template for provider keys
+.aienv                        # gitignored — your actual keys (copy of the sample)
 .lunaris/
   state/                     # events.db, memory state, instance.json (machine-local id), queues
   memory/graph.db            # knowledge-graph memory
