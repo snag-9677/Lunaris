@@ -249,6 +249,24 @@ test('FIX 2: a chained rm-rf $VAR queues even with a benign-prefixed allow rule'
   assert.equal(e.evaluate('run_bash', { command: 'echo start && rm -rf $HOME' }, clean).effect, 'queue');
 });
 
+// ---------------- FIX 5: plugin-namespaced tools follow the workspace-write posture ----------------
+
+test('FIX 5: a plugin-namespaced tool is denied at L0, queued at L1, allowed at L2/L3', () => {
+  const tool = 'dev.acme.pg-tools/query'; // <pluginId>/<toolName>
+  assert.equal(new RulePolicyEngine({ level: 0 }).evaluate(tool, {}, clean).effect, 'deny');
+  assert.equal(new RulePolicyEngine({ level: 1 }).evaluate(tool, {}, clean).effect, 'queue');
+  assert.equal(new RulePolicyEngine({ level: 2 }).evaluate(tool, {}, clean).effect, 'allow');
+  assert.equal(new RulePolicyEngine({ level: 3 }).evaluate(tool, {}, clean).effect, 'allow');
+});
+
+test('FIX 5: an explicit allow rule lets a plugin tool run below L2', () => {
+  const e = new RulePolicyEngine({
+    level: 1,
+    rules: [{ effect: 'allow', tools: ['dev.acme.pg-tools/*'], reason: 'trusted plugin' }],
+  });
+  assert.equal(e.evaluate('dev.acme.pg-tools/query', {}, clean).effect, 'allow');
+});
+
 test('rule predicates: path and domain globs gate matching', () => {
   const e = new RulePolicyEngine({
     level: 2,

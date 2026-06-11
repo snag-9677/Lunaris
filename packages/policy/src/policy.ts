@@ -98,6 +98,19 @@ function hostOf(url: string | undefined): string {
   }
 }
 
+/**
+ * Plugin-namespaced tools are emitted by @lunaris/plugd as `<pluginId>/<tool>`
+ * (the '/' is the namespace separator). These run with daemon privileges and —
+ * in v1 — WITHOUT a sandbox, so they bypass the builtin path-confinement that
+ * file/bash tools rely on. FIX 5: treat them like workspace-write actions in the
+ * level default (L0 deny, L1 queue, L2/L3 allow) so they are not auto-allowed
+ * below L2 unless an explicit allow rule names them. NOTE: enabling a plugin
+ * therefore grants its tools ungated execution at L2+ (no sandbox in v1).
+ */
+function isPluginNamespacedTool(tool: string): boolean {
+  return tool.includes('/');
+}
+
 function isReadTool(tool: string): boolean {
   return (READ_TOOLS as readonly string[]).includes(tool);
 }
@@ -427,6 +440,10 @@ export class RulePolicyEngine implements PolicyEngine {
     const net = isNetworkTool(tool);
     const write = isFileWriteTool(tool);
     const bash = isBashTool(tool);
+    // FIX 5: plugin-namespaced tools (`<id>/<tool>`) run unsandboxed at daemon
+    // privilege, so default them with the workspace-write posture rather than
+    // the catch-all level default — never auto-allowed below L2.
+    const plugin = isPluginNamespacedTool(tool);
 
     switch (this.level) {
       case 0: // read-only
@@ -436,11 +453,14 @@ export class RulePolicyEngine implements PolicyEngine {
         if (read || net) return { effect: 'allow', reason: 'L1 supervised: allow read/fetch' };
         if (write || bash)
           return { effect: 'queue', reason: 'L1 supervised: writes/bash need approval' };
+        if (plugin)
+          return { effect: 'queue', reason: 'L1 supervised: plugin tool needs approval' };
         return { effect: 'queue', reason: 'L1 supervised: unknown tool needs approval' };
       case 2: // autonomous-in-workspace
         if (read || net) return { effect: 'allow', reason: 'L2 workspace: allow read/fetch' };
         if (write || bash)
           return { effect: 'allow', reason: 'L2 workspace: allow file/bash in workspace' };
+        if (plugin) return { effect: 'allow', reason: 'L2 workspace: allow plugin tool' };
         return { effect: 'queue', reason: 'L2 workspace: unknown tool needs approval' };
       case 3: // full-auto
       default:

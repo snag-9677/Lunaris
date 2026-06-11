@@ -306,6 +306,189 @@ export interface ProjectAnalytics {
   tools: { calls: number; failures: number };
 }
 
+// ---------- Optimizer (recursive self-optimization, propose-only v1) ----------
+
+export interface TaskOutcome {
+  taskId: string;
+  projectId: string;
+  taskClass: string; // 'code' | 'research' | 'test' | 'chat' | ...
+  role: string;
+  model: string;
+  status: 'success' | 'partial' | 'failed' | 'blocked';
+  /** infra failures are excluded from model/prompt quality stats. */
+  failureClass?: FailureClass;
+  costUsd: number;
+  durationMs: number;
+  tokensIn: number;
+  tokensOut: number;
+  ts: string;
+}
+
+export interface OutcomeStats {
+  key: string; // "<taskClass>/<role>/<model>"
+  taskClass: string;
+  role: string;
+  model: string;
+  n: number;
+  successes: number;
+  /** Wilson lower bound on success rate. */
+  successRate: number;
+  avgCostUsd: number;
+  avgDurationMs: number;
+}
+
+/** One arm of the per-task-class routing bandit. */
+export interface RoutingArm {
+  taskClass: string;
+  model: string;
+  pulls: number;
+  reward: number; // cumulative
+  meanReward: number;
+}
+
+export interface RoutingSuggestion {
+  taskClass: string;
+  recommendedModel: string;
+  rationale: string;
+  confidence: number; // 0..1
+  basedOnN: number;
+}
+
+export type ProposalKind = 'routing' | 'capability' | 'prompt';
+
+/** Optimizer output is ALWAYS a proposal — never auto-applied in v1. */
+export interface ConfigProposal {
+  id: string;
+  projectId: string;
+  kind: ProposalKind;
+  title: string;
+  detail: string;
+  /** human-readable suggested change, e.g. a routing-table diff. */
+  diff?: string;
+  status: 'pending' | 'approved' | 'rejected';
+  createdAt: string;
+  confidence: number;
+}
+
+export interface OptimizerReport {
+  projectId: string;
+  generatedAt: string;
+  stats: OutcomeStats[];
+  routing: RoutingSuggestion[];
+  proposals: ConfigProposal[];
+  notes: string[];
+}
+
+// ---------- Plugins (plugd, v1: tools + MCP server defs only) ----------
+
+export interface PluginToolDef extends ToolDef {
+  /** module path relative to plugin root exporting an execute fn. */
+  module: string;
+  /** named export, default 'execute'. */
+  export?: string;
+}
+
+export interface PluginMcpServerDef {
+  name: string;
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+}
+
+export interface PluginManifest {
+  id: string; // reverse-DNS, e.g. dev.acme.pg-tools
+  version: string;
+  description?: string;
+  /** harness compat semver range. */
+  lunaris?: string;
+  tools?: PluginToolDef[];
+  mcpServers?: PluginMcpServerDef[];
+  /** requested capabilities — advisory in v1, surfaced at install. */
+  permissions?: string[];
+}
+
+export interface LoadedPlugin {
+  manifest: PluginManifest;
+  root: string;
+  enabled: boolean;
+}
+
+/** A plugin tool resolved to an executable, ready for the orchestrator registry. */
+export interface ResolvedTool {
+  def: ToolDef;
+  pluginId: string;
+  execute(args: unknown, ctx: unknown): Promise<string>;
+}
+
+export interface PluginHost {
+  list(): LoadedPlugin[];
+  enable(id: string): void;
+  disable(id: string): void;
+  /** resolved tools of all enabled plugins, namespaced <pluginId>/<tool>. */
+  enabledTools(): Promise<ResolvedTool[]>;
+}
+
+// ---------- Scheduler / triggers / goal queue ----------
+
+export type QueuedGoalStatus = 'queued' | 'leased' | 'done' | 'failed' | 'dead';
+
+export interface QueuedGoal {
+  id: string;
+  projectId: string;
+  prompt: string;
+  priority: number; // higher runs first
+  status: QueuedGoalStatus;
+  /** 'cli' | 'ui' | 'schedule:<id>' | 'webhook:<source>' */
+  source: string;
+  notBefore?: string;
+  attempts: number;
+  maxAttempts: number;
+  createdAt: string;
+  leasedAt?: string;
+  /** the orchestrator run id this produced once dispatched. */
+  goalId?: string;
+  lastError?: string;
+}
+
+export interface GoalTemplate {
+  id: string;
+  name: string;
+  /** placeholders {{var}} filled from schedule/trigger vars. */
+  promptTemplate: string;
+}
+
+export interface Schedule {
+  id: string;
+  projectId: string;
+  cron: string; // 5-field
+  templateId?: string;
+  prompt?: string; // inline alternative to a template
+  vars?: Record<string, string>;
+  enabled: boolean;
+  lastRunAt?: string;
+  nextRunAt?: string;
+}
+
+export interface TriggerRule {
+  id: string;
+  projectId: string;
+  source: string; // 'github' | 'generic'
+  eventTypes: string[];
+  promptTemplate: string;
+  enabled: boolean;
+}
+
+export interface GoalQueue {
+  push(
+    g: Omit<QueuedGoal, 'id' | 'status' | 'attempts' | 'createdAt'> & { maxAttempts?: number },
+  ): QueuedGoal;
+  /** highest-priority eligible goal (status queued, notBefore<=now), marked leased. */
+  lease(now?: Date): QueuedGoal | null;
+  complete(id: string, goalId: string): void;
+  fail(id: string, retry: boolean, error?: string): void;
+  list(projectId?: string, status?: QueuedGoalStatus): QueuedGoal[];
+}
+
 // ---------- Manifest (lunaris.toml) ----------
 
 export interface ProviderConfig {

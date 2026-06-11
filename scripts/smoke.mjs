@@ -14,6 +14,10 @@
  * 5. Runs the Phase 2 smoke (scripts/smoke-phase2.mjs) which exercises memory
  *    retention + brief, the PolicyEngine at L0/L2, computeAnalytics over a real
  *    events.db, and GET /api/projects/:id/analytics — all offline.
+ * 6. Runs the Phase 3 smoke (scripts/smoke-phase3.mjs) which exercises the
+ *    optimizer (stats + a persisted proposal), the plugin host (scaffold ->
+ *    enable -> resolve -> execute), the scheduler goal queue (priority lease),
+ *    the cron nextRun, and GET /api/projects/:id/proposals — all offline.
  *
  * Run from anywhere: node scripts/smoke.mjs — exits 0 on success.
  */
@@ -23,6 +27,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runPhase2Smoke } from './smoke-phase2.mjs';
+import { runPhase3Smoke } from './smoke-phase3.mjs';
 
 const core = await import(new URL('../packages/core/dist/index.js', import.meta.url).href);
 const gatewayPkg = await import(new URL('../packages/gateway/dist/index.js', import.meta.url).href);
@@ -122,6 +127,9 @@ try {
 
   // ---- 5. Phase 2 substrate (memory / policy / analytics / daemon route) ----
   await runPhase2Smoke();
+
+  // ---- 6. Phase 3 substrate (optimizer / plugd / scheduler / cron / route) --
+  await runPhase3Smoke();
 } finally {
   if (app) await app.close().catch(() => {});
   events?.close?.();

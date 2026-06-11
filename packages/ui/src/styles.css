@@ -674,3 +674,223 @@ body {
 .ticket-actions .deny:hover:not(:disabled) {
   border-color: var(--red);
 }
+
+/* ---------- Phase 3: optimize / plugins / automation ---------- */
+
+/* routing suggestions */
+.suggestion {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+}
+
+.suggestion-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.suggestion-arrow {
+  color: var(--fg-dim);
+}
+
+.suggestion-why {
+  margin-top: 5px;
+  color: var(--fg-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.opt-notes {
+  margin-top: 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.opt-note {
+  color: var(--fg-dim);
+  font-size: 11px;
+  margin-bottom: 3px;
+}
+
+.proposal-detail {
+  margin-top: 5px;
+  color: var(--fg-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* plugins */
+.plugin-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 9px 10px;
+  margin-bottom: 8px;
+}
+
+.plugin-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.plugin-id {
+  color: var(--fg);
+}
+
+.plugin-desc {
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+
+.toggle {
+  border-radius: 4px;
+  padding: 4px 14px;
+  font: inherit;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--bg-raised);
+  flex-shrink: 0;
+}
+
+.toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.toggle.on {
+  color: var(--green);
+  border-color: #32422a;
+}
+
+.toggle.off {
+  color: var(--fg-dim);
+}
+
+.toggle:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+/* automation: schedules + queue */
+.sched-add {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.sched-add input {
+  background: var(--bg-raised);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 5px 8px;
+  font: inherit;
+}
+
+.sched-add input:first-child {
+  width: 130px;
+  flex-shrink: 0;
+}
+
+.sched-add input:nth-child(2) {
+  flex: 1;
+}
+
+.sched-add input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.sched-add button {
+  background: var(--bg-raised);
+  color: var(--accent);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 5px 12px;
+  font: inherit;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.sched-add button:disabled {
+  color: var(--fg-dim);
+  cursor: not-allowed;
+}
+
+.sched-row,
+.queue-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+}
+
+.sched-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.sched-prompt,
+.queue-prompt {
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-prompt {
+  flex: 1;
+  min-width: 0;
+}
+
+.sched-row .deny {
+  border: 1px solid #5a2a35;
+  border-radius: 4px;
+  padding: 3px 10px;
+  font: inherit;
+  cursor: pointer;
+  color: var(--red);
+  background: var(--bg-raised);
+  flex-shrink: 0;
+}
+
+.sched-row .deny:hover {
+  border-color: var(--red);
+}
+
+.badge.queue-queued {
+  color: var(--amber);
+  border-color: #4a3c25;
+}
+
+.badge.queue-done {
+  color: var(--green);
+  border-color: #32422a;
+}
+
+.badge.queue-leased {
+  color: var(--cyan);
+  border-color: #2a4254;
+}
+
+.badge.queue-failed,
+.badge.queue-dead {
+  color: var(--red);
+  border-color: #5a2a35;
+}

@@ -188,6 +188,146 @@ export function formatApprovalLine(t: ApprovalTicketLike): string {
   return `${id}  ${status}  ${t.tool ?? '?'}  — ${t.reason ?? ''}`;
 }
 
+/* ---------- Phase 3: optimizer / plugins / scheduler renderers ---------- */
+
+/** Minimal views (mirror @lunaris/core; keep format.ts dep-free at runtime). */
+export interface OutcomeStatsLike {
+  taskClass: string;
+  role: string;
+  model: string;
+  n: number;
+  successes: number;
+  successRate: number;
+  avgCostUsd: number;
+}
+export interface RoutingSuggestionLike {
+  taskClass: string;
+  recommendedModel: string;
+  rationale: string;
+  confidence: number;
+  basedOnN: number;
+}
+export interface ConfigProposalLike {
+  id: string;
+  kind: string;
+  title: string;
+  detail?: string;
+  status: string;
+  confidence: number;
+}
+export interface OptimizerReportLike {
+  projectId: string;
+  generatedAt: string;
+  stats: OutcomeStatsLike[];
+  routing: RoutingSuggestionLike[];
+  proposals: ConfigProposalLike[];
+  notes: string[];
+}
+
+/** Render an OptimizerReport as plain-text lines: stats table, routing, proposals. */
+export function formatOptimizerReport(r: OptimizerReportLike): string[] {
+  const lines: string[] = [];
+  lines.push(`optimizer report · ${r.projectId} · ${r.generatedAt}`);
+
+  lines.push('');
+  lines.push('success rate by class/role/model:');
+  if (r.stats.length === 0) {
+    lines.push('  (no task outcomes yet)');
+  } else {
+    const keyOf = (s: OutcomeStatsLike): string => `${s.taskClass}/${s.role}/${s.model}`;
+    const keyW = Math.max(5, ...r.stats.map((s) => keyOf(s).length));
+    for (const s of r.stats) {
+      lines.push(
+        `  ${keyOf(s).padEnd(keyW)}  ${String(s.successes).padStart(3)}/${String(s.n).padEnd(3)}  ` +
+          `${(s.successRate * 100).toFixed(1).padStart(5)}%  $${s.avgCostUsd.toFixed(4)}/task`,
+      );
+    }
+  }
+
+  lines.push('');
+  lines.push('routing suggestions:');
+  if (r.routing.length === 0) {
+    lines.push('  (none yet — need more pulls per arm)');
+  } else {
+    for (const s of r.routing) {
+      lines.push(
+        `  ${s.taskClass} → ${s.recommendedModel}  (conf ${(s.confidence * 100).toFixed(0)}%, n=${s.basedOnN})`,
+      );
+      lines.push(`    ${s.rationale}`);
+    }
+  }
+
+  lines.push('');
+  lines.push(`proposals (${r.proposals.length}):`);
+  if (r.proposals.length === 0) {
+    lines.push('  (none)');
+  } else {
+    for (const p of r.proposals) {
+      lines.push(`  ${p.id.slice(0, 8)}  [${p.kind}] ${p.status.padEnd(8)} ${p.title}`);
+    }
+  }
+
+  for (const note of r.notes) lines.push(`note: ${note}`);
+  return lines;
+}
+
+/** One-line rendering of a ConfigProposal. */
+export function formatProposalLine(p: ConfigProposalLike): string {
+  const id = p.id.slice(0, 12);
+  const conf = `${(p.confidence * 100).toFixed(0)}%`;
+  return `${id}  [${p.kind}] ${p.status.padEnd(8)} (conf ${conf})  ${p.title}`;
+}
+
+/** Minimal LoadedPlugin view for one-line CLI rendering. */
+export interface LoadedPluginLike {
+  manifest: { id: string; version: string; description?: string };
+  enabled: boolean;
+}
+
+/** One-line rendering of a plugin. */
+export function formatPluginLine(p: LoadedPluginLike): string {
+  const mark = p.enabled ? '[on] ' : '[off]';
+  const desc = p.manifest.description ? `  — ${p.manifest.description}` : '';
+  return `${mark} ${p.manifest.id}@${p.manifest.version}${desc}`;
+}
+
+/** Minimal Schedule view for one-line CLI rendering. */
+export interface ScheduleLike {
+  id: string;
+  cron: string;
+  prompt?: string;
+  templateId?: string;
+  enabled: boolean;
+  nextRunAt?: string;
+}
+
+/** One-line rendering of a schedule. */
+export function formatScheduleLine(s: ScheduleLike): string {
+  const id = s.id.slice(0, 12);
+  const state = s.enabled ? 'on ' : 'off';
+  const next = s.nextRunAt ? ` next=${s.nextRunAt}` : '';
+  const body = s.prompt ?? (s.templateId ? `template:${s.templateId}` : '(no prompt)');
+  return `${id}  ${state}  ${s.cron.padEnd(16)}${next}  ${truncate(body, 50)}`;
+}
+
+/** Minimal QueuedGoal view for one-line CLI rendering. */
+export interface QueuedGoalLike {
+  id: string;
+  prompt: string;
+  priority: number;
+  status: string;
+  source: string;
+  attempts: number;
+  maxAttempts: number;
+}
+
+/** One-line rendering of a queued goal. */
+export function formatQueuedGoalLine(g: QueuedGoalLike): string {
+  const id = g.id.slice(0, 12);
+  const status = g.status.padEnd(7);
+  return `${id}  ${status}  p${g.priority}  ${g.attempts}/${g.maxAttempts}  ${g.source.padEnd(14)}  ${truncate(g.prompt, 50)}`;
+}
+
 /** Normalize initManifest()'s return value into a list of created file paths. */
 export function createdFilesFrom(result: unknown): string[] {
   if (typeof result === 'string') return [result];

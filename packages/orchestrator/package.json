@@ -16,6 +16,7 @@
     "@lunaris/core": "workspace:*",
     "@lunaris/gateway": "workspace:*",
     "@lunaris/memory": "workspace:*",
+    "@lunaris/plugd": "workspace:*",
     "@lunaris/policy": "workspace:*"
   },
   "devDependencies": {

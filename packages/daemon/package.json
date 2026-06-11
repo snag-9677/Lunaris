@@ -22,6 +22,9 @@
     "@lunaris/orchestrator": "workspace:*",
     "@lunaris/memory": "workspace:*",
     "@lunaris/policy": "workspace:*",
+    "@lunaris/optimizer": "workspace:*",
+    "@lunaris/plugd": "workspace:*",
+    "@lunaris/scheduler": "workspace:*",
     "fastify": "^5.0.0",
     "@fastify/websocket": "^11.0.0",
     "@fastify/static": "^8.0.0"

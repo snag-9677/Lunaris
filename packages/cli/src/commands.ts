@@ -19,6 +19,14 @@ import type {
   MemoryRecord,
   ProjectAnalytics,
 } from '@lunaris/core';
+import type {
+  ConfigProposal,
+  LoadedPlugin,
+  OptimizerReport,
+  QueuedGoal,
+  QueuedGoalStatus,
+  Schedule,
+} from '@lunaris/core';
 import {
   createdFilesFrom,
   exitCodeForStatus,
@@ -26,6 +34,11 @@ import {
   formatApprovalLine,
   formatEventLine,
   formatMemoryLine,
+  formatOptimizerReport,
+  formatPluginLine,
+  formatProposalLine,
+  formatQueuedGoalLine,
+  formatScheduleLine,
   normalizeResult,
   resolveModel,
   tailEvents,
@@ -85,6 +98,26 @@ export function memoryDbPath(cwd: string): string {
 
 export function approvalsDbPath(cwd: string): string {
   return join(cwd, '.lunaris', 'state', 'approvals.db');
+}
+
+export function banditDbPath(cwd: string): string {
+  return join(cwd, '.lunaris', 'state', 'bandit.db');
+}
+
+export function proposalDbPath(cwd: string): string {
+  return join(cwd, '.lunaris', 'state', 'proposals.db');
+}
+
+export function queueDbPath(cwd: string): string {
+  return join(cwd, '.lunaris', 'state', 'queue.db');
+}
+
+export function scheduleDbPath(cwd: string): string {
+  return join(cwd, '.lunaris', 'state', 'schedules.db');
+}
+
+export function pluginsDir(cwd: string): string {
+  return join(cwd, '.lunaris', 'plugins');
 }
 
 export async function loadProjectManifest(cwd: string): Promise<LunarisManifest> {
@@ -364,6 +397,321 @@ export async function runApprovals(cwd: string, opts: ApprovalsOptions = {}): Pr
       } else {
         for (const t of pending) console.log(formatApprovalLine(t));
       }
+      return 0;
+    } finally {
+      queue.close();
+    }
+  } catch (err) {
+    return fail(err);
+  }
+}
+
+// ---------- lun optimize ----------
+
+/** Structural view of @lunaris/optimizer's runOptimizer. */
+type RunOptimizerFn = (opts: {
+  store: EventStore | string;
+  banditDbPath: string;
+  proposalDbPath: string;
+  projectId: string;
+  sinceIso?: string;
+  minSuggestionN?: number;
+}) => OptimizerReport;
+
+export async function runOptimize(cwd: string, sinceIso?: string): Promise<number> {
+  try {
+    const manifest = await loadProjectManifest(cwd);
+    if (!existsSync(eventsDbPath(cwd))) {
+      console.log('no events recorded yet — nothing to optimize');
+      return 0;
+    }
+    const optimizerMod = await loadModule('@lunaris/optimizer');
+    const runOptimizer = pick<RunOptimizerFn>(optimizerMod, ['runOptimizer'], '@lunaris/optimizer runOptimizer');
+    mkdirSync(join(cwd, '.lunaris', 'state'), { recursive: true });
+    const report = runOptimizer({
+      // Pass the db path string — the optimizer opens the event store read-only.
+      store: eventsDbPath(cwd),
+      banditDbPath: banditDbPath(cwd),
+      proposalDbPath: proposalDbPath(cwd),
+      projectId: manifest.project.id,
+      ...(sinceIso !== undefined ? { sinceIso } : {}),
+    });
+    for (const line of formatOptimizerReport(report)) console.log(line);
+    return 0;
+  } catch (err) {
+    return fail(err);
+  }
+}
+
+// ---------- lun proposals ----------
+
+export interface ProposalsOptions {
+  resolve?: string;
+  approve?: boolean;
+  reject?: boolean;
+  status?: string;
+}
+
+interface ProposalStoreLike {
+  list(projectId?: string, status?: ConfigProposal['status']): ConfigProposal[];
+  resolve(id: string, approved: boolean): ConfigProposal | undefined;
+  close(): void;
+}
+
+export async function runProposals(cwd: string, opts: ProposalsOptions = {}): Promise<number> {
+  try {
+    const manifest = await loadProjectManifest(cwd);
+    if (!existsSync(proposalDbPath(cwd))) {
+      console.log('no proposals yet — run `lun optimize` first');
+      return 0;
+    }
+    const optimizerMod = await loadModule('@lunaris/optimizer');
+    const StoreCtor = pick<new (dbPath: string) => ProposalStoreLike>(
+      optimizerMod,
+      ['SqliteProposalStore'],
+      '@lunaris/optimizer SqliteProposalStore',
+    );
+    const store = new StoreCtor(proposalDbPath(cwd));
+    try {
+      if (opts.resolve !== undefined) {
+        if (opts.approve === undefined && opts.reject === undefined) {
+          throw new Error('--resolve requires --approve or --reject');
+        }
+        const approved = opts.approve === true && opts.reject !== true;
+        const resolved = store.resolve(opts.resolve, approved);
+        if (resolved === undefined) {
+          console.error(`unknown proposal: ${opts.resolve}`);
+          return 1;
+        }
+        console.log(`${resolved.id} → ${resolved.status}`);
+        return 0;
+      }
+      const valid = new Set(['pending', 'approved', 'rejected']);
+      const status = opts.status !== undefined && valid.has(opts.status) ? (opts.status as ConfigProposal['status']) : undefined;
+      const list = store.list(manifest.project.id, status);
+      if (list.length === 0) {
+        console.log('no proposals');
+      } else {
+        for (const p of list) console.log(formatProposalLine(p));
+      }
+      return 0;
+    } finally {
+      store.close();
+    }
+  } catch (err) {
+    return fail(err);
+  }
+}
+
+// ---------- lun plugins / lun plugin ... ----------
+
+interface PluginHostLike {
+  list(): LoadedPlugin[];
+  enable(id: string): void;
+  disable(id: string): void;
+}
+type ScaffoldPluginFn = (dir: string, opts: { id: string; name: string; version?: string; force?: boolean }) => void;
+
+async function openPluginHost(cwd: string): Promise<PluginHostLike> {
+  const plugd = await loadModule('@lunaris/plugd');
+  const HostCtor = pick<new (opts: { pluginsDir: string }) => PluginHostLike>(
+    plugd,
+    ['FilePluginHost'],
+    '@lunaris/plugd FilePluginHost',
+  );
+  return new HostCtor({ pluginsDir: pluginsDir(cwd) });
+}
+
+export async function runPlugins(cwd: string): Promise<number> {
+  try {
+    await loadProjectManifest(cwd);
+    if (!existsSync(pluginsDir(cwd))) {
+      console.log('no plugins directory — add plugins under .lunaris/plugins or run `lun plugin new <dir>`');
+      return 0;
+    }
+    const host = await openPluginHost(cwd);
+    const plugins = host.list();
+    if (plugins.length === 0) {
+      console.log('no plugins found');
+    } else {
+      for (const p of plugins) console.log(formatPluginLine(p));
+    }
+    return 0;
+  } catch (err) {
+    return fail(err);
+  }
+}
+
+export async function runPluginNew(cwd: string, dir: string, id?: string, name?: string): Promise<number> {
+  try {
+    const plugd = await loadModule('@lunaris/plugd');
+    const scaffold = pick<ScaffoldPluginFn>(plugd, ['scaffoldPlugin'], '@lunaris/plugd scaffoldPlugin');
+    // Default the plugin id/name from the target dir basename when not supplied.
+    const base = dir.replace(/[/\\]+$/, '').split(/[/\\]/).pop() ?? 'plugin';
+    const pluginId = id ?? `local.${base.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`;
+    const target = existsSync(dir) || dir.includes('/') || dir.includes('\\') ? dir : join(pluginsDir(cwd), dir);
+    scaffold(target, { id: pluginId, name: name ?? base });
+    console.log(`scaffolded plugin ${pluginId} at ${target}`);
+    return 0;
+  } catch (err) {
+    return fail(err);
+  }
+}
+
+/** Reject plugin ids that could escape a directory (mirrors the daemon's isSafePathSegment). */
+function isSafePluginId(id: string): boolean {
+  return id.length > 0 && !id.includes('/') && !id.includes('\\') && id !== '.' && id !== '..' && !id.includes('\0');
+}
+
+export async function runPluginToggle(cwd: string, id: string, enable: boolean): Promise<number> {
+  try {
+    await loadProjectManifest(cwd);
+    // Validate the id before it reaches the host (which uses it in a path lookup).
+    if (!isSafePluginId(id)) {
+      console.error(`invalid plugin id: ${id}`);
+      return 1;
+    }
+    const host = await openPluginHost(cwd);
+    if (enable) host.enable(id);
+    else host.disable(id);
+    console.log(`${id} → ${enable ? 'enabled' : 'disabled'}`);
+    return 0;
+  } catch (err) {
+    return fail(err);
+  }
+}
+
+// ---------- lun schedule ----------
+
+interface ScheduleStoreLike {
+  create(input: { projectId: string; cron: string; prompt?: string; vars?: Record<string, string>; enabled?: boolean }): Schedule;
+  list(projectId?: string): Schedule[];
+  delete(id: string): boolean;
+  close(): void;
+}
+
+export interface ScheduleOptions {
+  cron?: string;
+  prompt?: string;
+  rm?: string;
+}
+
+async function openScheduleStore(cwd: string): Promise<ScheduleStoreLike> {
+  const scheduler = await loadModule('@lunaris/scheduler');
+  const StoreCtor = pick<new (dbPath: string) => ScheduleStoreLike>(
+    scheduler,
+    ['SqliteScheduleStore'],
+    '@lunaris/scheduler SqliteScheduleStore',
+  );
+  return new StoreCtor(scheduleDbPath(cwd));
+}
+
+export async function runSchedule(cwd: string, opts: ScheduleOptions = {}): Promise<number> {
+  try {
+    const manifest = await loadProjectManifest(cwd);
+
+    // Remove a schedule.
+    if (opts.rm !== undefined) {
+      if (!existsSync(scheduleDbPath(cwd))) {
+        console.error(`unknown schedule: ${opts.rm}`);
+        return 1;
+      }
+      const store = await openScheduleStore(cwd);
+      try {
+        const ok = store.delete(opts.rm);
+        console.log(ok ? `removed ${opts.rm}` : `unknown schedule: ${opts.rm}`);
+        return ok ? 0 : 1;
+      } finally {
+        store.close();
+      }
+    }
+
+    // Add a schedule.
+    if (opts.cron !== undefined || opts.prompt !== undefined) {
+      if (opts.cron === undefined || opts.prompt === undefined) {
+        throw new Error('adding a schedule requires both --cron <expr> and --prompt <p>');
+      }
+      const store = await openScheduleStore(cwd);
+      try {
+        const s = store.create({ projectId: manifest.project.id, cron: opts.cron, prompt: opts.prompt });
+        console.log(`created ${s.id} (${s.cron}) next=${s.nextRunAt ?? '?'}`);
+        return 0;
+      } finally {
+        store.close();
+      }
+    }
+
+    // List schedules (default).
+    if (!existsSync(scheduleDbPath(cwd))) {
+      console.log('no schedules');
+      return 0;
+    }
+    const store = await openScheduleStore(cwd);
+    try {
+      const list = store.list(manifest.project.id);
+      if (list.length === 0) console.log('no schedules');
+      else for (const s of list) console.log(formatScheduleLine(s));
+      return 0;
+    } finally {
+      store.close();
+    }
+  } catch (err) {
+    return fail(err);
+  }
+}
+
+// ---------- lun queue ----------
+
+interface GoalQueueLike {
+  push(g: { projectId: string; prompt: string; source: string; priority?: number }): QueuedGoal;
+  list(projectId?: string, status?: QueuedGoalStatus): QueuedGoal[];
+  close(): void;
+}
+
+export interface QueueOptions {
+  push?: string;
+  priority?: number;
+}
+
+async function openGoalQueue(cwd: string): Promise<GoalQueueLike> {
+  const scheduler = await loadModule('@lunaris/scheduler');
+  const QueueCtor = pick<new (dbPath: string) => GoalQueueLike>(
+    scheduler,
+    ['SqliteGoalQueue'],
+    '@lunaris/scheduler SqliteGoalQueue',
+  );
+  return new QueueCtor(queueDbPath(cwd));
+}
+
+export async function runQueue(cwd: string, opts: QueueOptions = {}): Promise<number> {
+  try {
+    const manifest = await loadProjectManifest(cwd);
+
+    if (opts.push !== undefined) {
+      const queue = await openGoalQueue(cwd);
+      try {
+        const g = queue.push({
+          projectId: manifest.project.id,
+          prompt: opts.push,
+          source: 'cli',
+          priority: opts.priority ?? 0,
+        });
+        console.log(`queued ${g.id} (p${g.priority})`);
+        return 0;
+      } finally {
+        queue.close();
+      }
+    }
+
+    if (!existsSync(queueDbPath(cwd))) {
+      console.log('queue is empty');
+      return 0;
+    }
+    const queue = await openGoalQueue(cwd);
+    try {
+      const list = queue.list(manifest.project.id);
+      if (list.length === 0) console.log('queue is empty');
+      else for (const g of list) console.log(formatQueuedGoalLine(g));
       return 0;
     } finally {
       queue.close();

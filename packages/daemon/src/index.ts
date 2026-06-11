@@ -4,3 +4,15 @@ export { ProjectRegistry, defaultRegistryPath } from './registry.js';
 export type { RegisteredProject, RegistryData } from './registry.js';
 export { defaultGoalRunner, memoryDbPath, approvalsDbPath } from './goal-runner.js';
 export type { GoalRunner, GoalRunContext, AgentLoopExtras } from './goal-runner.js';
+export {
+  banditDbPath,
+  proposalDbPath,
+  queueDbPath,
+  scheduleDbPath,
+  triggerDbPath,
+  pluginsDir,
+  isSafePathSegment,
+  webhookSecretFor,
+} from './phase3.js';
+export { startSchedulerLoop } from './scheduler-loop.js';
+export type { SchedulerLoopHandle, StartSchedulerLoopOptions } from './scheduler-loop.js';

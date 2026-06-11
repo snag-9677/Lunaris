@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AnalyticsPanel, ApprovalsPanel, MemoryPanel } from './components/panels.js';
+import {
+  AnalyticsPanel,
+  ApprovalsPanel,
+  AutomationPanel,
+  MemoryPanel,
+  OptimizePanel,
+  PluginsPanel,
+} from './components/panels.js';
 
-type RightTab = 'feed' | 'analytics' | 'memory' | 'approvals';
+type RightTab = 'feed' | 'analytics' | 'memory' | 'approvals' | 'optimize' | 'plugins' | 'automation';
 
 /* ---------- types (mirror of @lunaris/core EventEnvelope; UI stays dep-free) ---------- */
 
@@ -370,7 +377,9 @@ export function App() {
 
         <section className="right">
           <div className="tabs">
-            {(['feed', 'analytics', 'memory', 'approvals'] as RightTab[]).map((tab) => (
+            {(
+              ['feed', 'analytics', 'memory', 'approvals', 'optimize', 'plugins', 'automation'] as RightTab[]
+            ).map((tab) => (
               <button
                 key={tab}
                 type="button"
@@ -392,6 +401,9 @@ export function App() {
           {rightTab === 'analytics' && <AnalyticsPanel projectId={selectedId} />}
           {rightTab === 'memory' && <MemoryPanel projectId={selectedId} />}
           {rightTab === 'approvals' && <ApprovalsPanel projectId={selectedId} />}
+          {rightTab === 'optimize' && <OptimizePanel projectId={selectedId} />}
+          {rightTab === 'plugins' && <PluginsPanel projectId={selectedId} />}
+          {rightTab === 'automation' && <AutomationPanel projectId={selectedId} />}
         </section>
       </main>
     </div>

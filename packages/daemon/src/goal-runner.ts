@@ -27,6 +27,7 @@ import type {
   MemoryStore,
   PolicyEngine,
   PolicyRule,
+  ResolvedTool,
   ResultEnvelope,
 } from '@lunaris/core';
 import * as gatewayPkg from '@lunaris/gateway';
@@ -38,6 +39,12 @@ export interface GoalRunContext {
   manifest: LunarisManifest;
   events: EventStore;
   projectRoot: string;
+  /**
+   * Phase 3: extra plugin-provided tools to expose to the AgentLoop for this
+   * run (namespaced <pluginId>/<tool>). Resolved by the caller from the
+   * project's FilePluginHost; optional so non-plugin runs are unaffected.
+   */
+  pluginTools?: ResolvedTool[];
 }
 
 /** Resolves with the goal's ResultEnvelope (if the loop produced one); rejects on infrastructure failure. */
@@ -52,12 +59,15 @@ interface GatewayExports {
   }) => unknown;
 }
 
-/** The Phase 2 autonomy substrate the loop may consume (all optional). */
+/** The Phase 2 autonomy substrate (+ Phase 3 plugin tools) the loop may consume (all optional). */
 export interface AgentLoopExtras {
   memory?: MemoryStore;
   policy?: PolicyEngine;
   taint?: unknown;
   approvals?: unknown;
+  /** Phase 3: plugin tools passed to the loop under both `tools` and `extraTools`. */
+  tools?: ResolvedTool[];
+  extraTools?: ResolvedTool[];
 }
 
 interface OrchestratorExports {
@@ -135,11 +145,17 @@ function manifestLevel(manifest: LunarisManifest): AutonomyLevel {
   return lvl === 0 || lvl === 1 || lvl === 2 || lvl === 3 ? (lvl as AutonomyLevel) : 2;
 }
 
-export const defaultGoalRunner: GoalRunner = async ({ goal, manifest, events, projectRoot }) => {
+export const defaultGoalRunner: GoalRunner = async ({ goal, manifest, events, projectRoot, pluginTools }) => {
   const ledger = new InMemoryBudgetLedger(manifest.budgets ?? {});
   const gateway = new ModelGateway({ manifest, events, ledger });
 
   const extras: AgentLoopExtras = {};
+  if (pluginTools !== undefined && pluginTools.length > 0) {
+    // Bind under both `tools` and `extraTools`: the loop's exact field name is
+    // owned by the orchestrator package, so we supply both and let it pick.
+    extras.tools = pluginTools;
+    extras.extraTools = pluginTools;
+  }
   let closeAll: () => void = () => {};
   const phase2 = await loadPhase2();
   if (phase2) {

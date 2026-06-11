@@ -16,8 +16,10 @@ import type {
   GoalStatus,
   MemoryProposal,
   MemoryStore,
+  PluginHost,
   PolicyDecision,
   PolicyEngine,
+  ResolvedTool,
   ResultEnvelope,
   RoleDef,
   StopReason,
@@ -89,6 +91,20 @@ export interface AgentLoopOptions {
   approvals?: ApprovalSink;
   /** Plan epoch stamped on approval tickets for the staleness guard. */
   planEpoch?: number;
+  /**
+   * Phase 3 — PLUGIN TOOLS (all OPTIONAL; Phase 1/2 callers are unaffected).
+   * Pre-resolved plugin tools to merge into the registry. Names are already
+   * namespaced `<pluginId>/<tool>` by the host. A role must still list the
+   * namespaced name in its `tools` allowlist for the tool to be offered/run.
+   */
+  extraTools?: ResolvedTool[];
+  /**
+   * A PluginHost whose enabledTools() are resolved ONCE at run start and merged
+   * alongside `extraTools`. If both are given, `extraTools` wins on a name clash.
+   * A host that throws while resolving is treated as contributing no tools — the
+   * run proceeds with built-ins only (plugins are additive, never load-bearing).
+   */
+  pluginHost?: PluginHost;
 }
 
 export interface AgentRunOutcome {
@@ -158,9 +174,20 @@ export class AgentLoop {
    */
   private readonly derivedPaths = new Map<string, Set<string>>();
 
+  /**
+   * Plugin tools (namespaced <pluginId>/<tool>) resolved once at the start of a
+   * run() and shared by the whole goal tree (orchestrator + subagents). Built-in
+   * tools always take precedence on a name clash. Empty until resolvePluginTools
+   * has run; resolution is idempotent per run().
+   */
+  private pluginTools = new Map<string, ResolvedTool>();
+
   constructor(private readonly opts: AgentLoopOptions) {}
 
   async run(goal: Goal, role = 'orchestrator'): Promise<AgentRunOutcome> {
+    // PLUGIN TOOLS: resolve enabled plugin tools (host + extraTools) once for the
+    // whole run. Built-ins win on any name clash; resolution never throws.
+    await this.resolvePluginTools();
     // MEMORY GUIDE: prepend an advisory memory brief (guide, not oracle) to the
     // top-level prompt before the loop runs. The guide-not-oracle header comes
     // from brief() itself; we just frame it as an advisory block.
@@ -395,6 +422,28 @@ export class AgentLoop {
     return this.opts.roles ?? builtinRoles;
   }
 
+  /**
+   * Build the per-run plugin-tool registry from the injected PluginHost (its
+   * enabledTools()) and any pre-resolved `extraTools`. Names are namespaced
+   * `<pluginId>/<tool>` by the host. `extraTools` is layered after the host so a
+   * test/caller-supplied tool wins on a name clash; a built-in tool of the same
+   * name still wins at dispatch/def time (see toolFor / toolDefsFor). A host that
+   * throws contributes nothing — plugins are additive, never load-bearing.
+   */
+  private async resolvePluginTools(): Promise<void> {
+    const map = new Map<string, ResolvedTool>();
+    const host = this.opts.pluginHost;
+    if (host !== undefined) {
+      try {
+        for (const tool of await host.enabledTools()) map.set(tool.def.name, tool);
+      } catch {
+        // Plugin resolution is best-effort; fall back to built-ins only.
+      }
+    }
+    for (const tool of this.opts.extraTools ?? []) map.set(tool.def.name, tool);
+    this.pluginTools = map;
+  }
+
   private async runInternal(
     goal: Goal,
     roleName: string,
@@ -618,14 +667,23 @@ export class AgentLoop {
       }
       return this.spawnSubagent(call.args, depth);
     }
-    const tool = builtinTools.get(call.name);
-    if (tool === undefined) {
-      throw new ToolError(`unknown tool: ${call.name}`);
-    }
-    return tool.execute(call.args, {
+    const ctx = {
       projectId: this.opts.projectId,
       projectRoot: this.opts.projectRoot,
-    });
+    };
+    const tool = builtinTools.get(call.name);
+    if (tool !== undefined) {
+      return tool.execute(call.args, ctx);
+    }
+    // PLUGIN TOOL: dispatch to a namespaced <pluginId>/<tool> resolved for this
+    // run. The plugin fn receives the same ToolContext opaquely (typed unknown
+    // per the ResolvedTool contract); a non-string return is JSON-coerced by the
+    // host's execute wrapper.
+    const plugin = this.pluginTools.get(call.name);
+    if (plugin !== undefined) {
+      return plugin.execute(call.args, ctx);
+    }
+    throw new ToolError(`unknown tool: ${call.name}`);
   }
 
   /** spawn_subagent: run a nested AgentLoop (depth max 1) and return its final text. */
@@ -678,8 +736,15 @@ export class AgentLoop {
         if (depth < MAX_SPAWN_DEPTH) defs.push(SPAWN_SUBAGENT_DEF);
         continue;
       }
-      const tool = builtinTools.get(name);
-      if (tool !== undefined) defs.push(tool.def);
+      const builtin = builtinTools.get(name);
+      if (builtin !== undefined) {
+        defs.push(builtin.def);
+        continue;
+      }
+      // A role may list a namespaced plugin tool (<pluginId>/<tool>); offer its
+      // def when an enabled plugin contributed it.
+      const plugin = this.pluginTools.get(name);
+      if (plugin !== undefined) defs.push(plugin.def);
     }
     return defs;
   }

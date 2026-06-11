@@ -8,14 +8,17 @@ import type {
   EventEnvelope,
   EventStore,
   Goal,
+  LoadedPlugin,
   MemoryBrief,
   MemoryEntity,
   MemoryProposal,
   MemoryRecord,
   MemoryRelation,
   MemoryStore,
+  PluginHost,
   PolicyDecision,
   PolicyEngine,
+  ResolvedTool,
   RetentionDecision,
   ResultEnvelope,
   RoleDef,
@@ -795,6 +798,251 @@ test('tainted task: memory write-back proposals are flagged tainted', async () =
     } finally {
       globalThis.fetch = realFetch;
     }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------- Phase 3: plugin-contributed tools ----------------
+
+/** Build a fake ResolvedTool whose execute() records its calls. */
+function fakeResolvedTool(
+  name: string,
+  pluginId: string,
+  impl: (args: unknown, ctx: unknown) => Promise<string> | string,
+): ResolvedTool & { calls: { args: unknown; ctx: unknown }[] } {
+  const calls: { args: unknown; ctx: unknown }[] = [];
+  return {
+    calls,
+    pluginId,
+    def: {
+      name,
+      description: `fake plugin tool ${name}`,
+      inputSchema: {
+        type: 'object',
+        properties: { q: { type: 'string' } },
+        required: ['q'],
+        additionalProperties: false,
+      },
+    },
+    async execute(args: unknown, ctx: unknown): Promise<string> {
+      calls.push({ args, ctx });
+      return impl(args, ctx);
+    },
+  };
+}
+
+/** Role that may call the namespaced plugin tool. */
+function pluginRole(toolName: string): RoleDef {
+  return {
+    name: 'plug-coder',
+    systemPrompt: 'use the plugin tool',
+    tools: ['read_file', toolName],
+    maxIterations: 8,
+  };
+}
+
+const PLUGIN_TOOL = 'dev.acme.pg-tools/query';
+
+test('extraTools: a plugin tool is offered to the model, executes, and emits a tool.call event', async () => {
+  const root = await makeRoot();
+  try {
+    const { store, events } = stubEvents();
+    const tool = fakeResolvedTool(PLUGIN_TOOL, 'dev.acme.pg-tools', () => 'rows: 3');
+    const role = pluginRole(PLUGIN_TOOL);
+    const gw = scriptedGateway((_req, call) => {
+      if (call === 1) {
+        return [
+          { type: 'tool_call', id: 'p1', name: PLUGIN_TOOL, args: { q: 'select 1' } },
+          end('tool_calls'),
+        ];
+      }
+      return [{ type: 'text_delta', text: 'plugin done' }, end('end')];
+    });
+    const loop = new AgentLoop({
+      gateway: gw,
+      events: store,
+      projectId: 'p1',
+      projectRoot: root,
+      model: 'mock/echo',
+      roles: { 'plug-coder': role },
+      extraTools: [tool],
+    });
+    const outcome = await loop.run(makeGoal('query the db'), 'plug-coder');
+
+    assert.equal(outcome.result.status, 'success');
+    assert.equal(outcome.finalText, 'plugin done');
+
+    // The model was offered the namespaced plugin tool in the first request.
+    const first = gw.requests[0];
+    assert.ok(first);
+    assert.ok((first.tools ?? []).some((t) => t.name === PLUGIN_TOOL));
+
+    // The plugin tool actually executed and received the loop's tool context.
+    assert.equal(tool.calls.length, 1);
+    assert.deepEqual(tool.calls[0]!.args, { q: 'select 1' });
+    assert.deepEqual(tool.calls[0]!.ctx, { projectId: 'p1', projectRoot: root });
+
+    // A tool.call event was emitted for the plugin tool.
+    const toolEvents = events.filter((e) => e.kind === 'tool.call');
+    assert.equal(toolEvents.length, 1);
+    const payload = toolEvents[0]!.payload as { name: string; ok: boolean };
+    assert.equal(payload.name, PLUGIN_TOOL);
+    assert.equal(payload.ok, true);
+
+    // Its result was fed back to the model.
+    const second = gw.requests[1];
+    assert.ok(second);
+    const toolMsg = second.messages[second.messages.length - 1];
+    assert.ok(toolMsg && toolMsg.role === 'tool');
+    const part = toolMsg.content[0];
+    assert.ok(part && part.type === 'tool_result');
+    assert.equal(part.content, 'rows: 3');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a denying policy still blocks a plugin tool (gate is not bypassed)', async () => {
+  const root = await makeRoot();
+  try {
+    const { store, events } = stubEvents();
+    const tool = fakeResolvedTool(PLUGIN_TOOL, 'dev.acme.pg-tools', () => 'rows: 3');
+    const policy = new FakePolicy((name) =>
+      name === PLUGIN_TOOL
+        ? { effect: 'deny', reason: 'plugin tool denied by policy' }
+        : allow(),
+    );
+    const role = pluginRole(PLUGIN_TOOL);
+    const gw = scriptedGateway((_req, call) => {
+      if (call === 1) {
+        return [
+          { type: 'tool_call', id: 'p1', name: PLUGIN_TOOL, args: { q: 'select 1' } },
+          end('tool_calls'),
+        ];
+      }
+      return [{ type: 'text_delta', text: 'adapted without the plugin' }, end('end')];
+    });
+    const loop = new AgentLoop({
+      gateway: gw,
+      events: store,
+      projectId: 'p1',
+      projectRoot: root,
+      model: 'mock/echo',
+      roles: { 'plug-coder': role },
+      extraTools: [tool],
+      policy,
+    });
+    const outcome = await loop.run(makeGoal('query the db'), 'plug-coder');
+
+    assert.equal(outcome.result.status, 'success');
+
+    // The plugin was gated (evaluated by the policy) but NEVER executed.
+    assert.ok(policy.seen.some((s) => s.tool === PLUGIN_TOOL));
+    assert.equal(tool.calls.length, 0);
+    assert.equal(events.filter((e) => e.kind === 'tool.call').length, 0);
+
+    // A policy.decision deny event was emitted and the model saw an error result.
+    const policyEvents = events.filter((e) => e.kind === 'policy.decision');
+    assert.equal(policyEvents.length, 1);
+    assert.equal((policyEvents[0]!.payload as { effect: string }).effect, 'deny');
+    const second = gw.requests[1];
+    assert.ok(second);
+    const toolMsg = second.messages[second.messages.length - 1];
+    assert.ok(toolMsg && toolMsg.role === 'tool');
+    const part = toolMsg.content[0];
+    assert.ok(part && part.type === 'tool_result');
+    assert.equal(part.isError, true);
+    assert.match(part.content, /Policy denied/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('pluginHost: enabledTools() are resolved once at run start and made callable', async () => {
+  const root = await makeRoot();
+  try {
+    const { store, events } = stubEvents();
+    const tool = fakeResolvedTool(PLUGIN_TOOL, 'dev.acme.pg-tools', () => 'host rows: 7');
+    let resolveCount = 0;
+    const host: PluginHost = {
+      list(): LoadedPlugin[] {
+        return [];
+      },
+      enable(): void {},
+      disable(): void {},
+      async enabledTools(): Promise<ResolvedTool[]> {
+        resolveCount++;
+        return [tool];
+      },
+    };
+    const role = pluginRole(PLUGIN_TOOL);
+    const gw = scriptedGateway((_req, call) => {
+      if (call === 1) {
+        return [
+          { type: 'tool_call', id: 'p1', name: PLUGIN_TOOL, args: { q: 'select 1' } },
+          end('tool_calls'),
+        ];
+      }
+      return [{ type: 'text_delta', text: 'host plugin done' }, end('end')];
+    });
+    const loop = new AgentLoop({
+      gateway: gw,
+      events: store,
+      projectId: 'p1',
+      projectRoot: root,
+      model: 'mock/echo',
+      roles: { 'plug-coder': role },
+      pluginHost: host,
+    });
+    const outcome = await loop.run(makeGoal('query via host'), 'plug-coder');
+
+    assert.equal(outcome.result.status, 'success');
+    // enabledTools() resolved exactly once for the whole run.
+    assert.equal(resolveCount, 1);
+    assert.equal(tool.calls.length, 1);
+    const toolEvents = events.filter((e) => e.kind === 'tool.call');
+    assert.equal(toolEvents.length, 1);
+    assert.equal((toolEvents[0]!.payload as { name: string }).name, PLUGIN_TOOL);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a throwing pluginHost is tolerated: run proceeds with built-ins only', async () => {
+  const root = await makeRoot();
+  try {
+    const { store } = stubEvents();
+    const host: PluginHost = {
+      list(): LoadedPlugin[] {
+        return [];
+      },
+      enable(): void {},
+      disable(): void {},
+      async enabledTools(): Promise<ResolvedTool[]> {
+        throw new Error('plugin discovery exploded');
+      },
+    };
+    const gw = scriptedGateway((_req, call) => {
+      if (call === 1) {
+        return [
+          { type: 'tool_call', id: 't1', name: 'list_dir', args: { path: '.' } },
+          end('tool_calls'),
+        ];
+      }
+      return [{ type: 'text_delta', text: 'fine without plugins' }, end('end')];
+    });
+    const loop = new AgentLoop({
+      gateway: gw,
+      events: store,
+      projectId: 'p1',
+      projectRoot: root,
+      model: 'mock/echo',
+      pluginHost: host,
+    });
+    const outcome = await loop.run(makeGoal('list the dir'), 'coder');
+    assert.equal(outcome.result.status, 'success');
+    assert.equal(outcome.finalText, 'fine without plugins');
   } finally {
     await rm(root, { recursive: true, force: true });
   }

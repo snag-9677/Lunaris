@@ -19,6 +19,9 @@
     "@lunaris/orchestrator": "workspace:*",
     "@lunaris/memory": "workspace:*",
     "@lunaris/policy": "workspace:*",
+    "@lunaris/optimizer": "workspace:*",
+    "@lunaris/plugd": "workspace:*",
+    "@lunaris/scheduler": "workspace:*",
     "commander": "^14.0.0"
   },
   "devDependencies": {
